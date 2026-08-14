@@ -135,9 +135,18 @@ npm test          # 运行测试
 
 **问：角色不够用？** 支持导入本地 FBX / OBJ 模型，导入后会自动进模型库。
 
-## 🤝 参与贡献
+## 🤝 一起共建
 
-欢迎提 Issue、提 PR。如果基于本项目继续发布，请确认新增模型、贴图和素材的分发许可。
+这个项目还在早期，一定有不少 bug，**欢迎所有人参与**——不一定非要会写代码：
+
+| 你想做的事 | 怎么做 |
+| --- | --- |
+| 🐛 发现 bug | 提 [Issue](https://github.com/ruijiaang-lab/open-director/issues/new/choose)，选「Bug 报告」模板，照表格填就行（最好带上截图） |
+| 💡 有功能想法 | 提 [Issue](https://github.com/ruijiaang-lab/open-director/issues/new/choose)，选「功能建议」模板 |
+| 🧑‍💻 想改代码 | 看 [CONTRIBUTING.md](./CONTRIBUTING.md)，从 clone 到提 PR 全流程都有 |
+| 🎬 用它做了作品 | 在 Issue 里分享（选「功能建议」模板写使用反馈），你的用法就是最好的需求调研 |
+
+如果基于本项目继续发布，请确认新增模型、贴图和素材的分发许可。
 
 ## 📄 License
 
