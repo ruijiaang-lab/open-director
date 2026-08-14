@@ -7,9 +7,9 @@ export interface AISettings {
 const SETTINGS_STORAGE_KEY = "open-director-ai-settings";
 
 export const DEFAULT_AI_SETTINGS: AISettings = {
-  baseUrl: "https://api.xiaomimimo.com",
+  baseUrl: "https://api.deepseek.com/anthropic",
   apiKey: "",
-  model: "mimo-v2.5-pro",
+  model: "deepseek-chat",
 };
 
 export function loadAISettings(): AISettings {

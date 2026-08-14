@@ -112,7 +112,7 @@ export function DirectorAssistantPanel() {
                 <input
                   value={settings.baseUrl}
                   onChange={(e) => setSettings((s) => ({ ...s, baseUrl: e.target.value }))}
-                  placeholder="https://api.xiaomimimo.com"
+                  placeholder="https://api.deepseek.com/anthropic"
                 />
               </label>
               <label>
@@ -120,7 +120,7 @@ export function DirectorAssistantPanel() {
                 <input
                   value={settings.model}
                   onChange={(e) => setSettings((s) => ({ ...s, model: e.target.value }))}
-                  placeholder="mimo-v2.5-pro"
+                  placeholder="deepseek-chat"
                 />
               </label>
               <label>
