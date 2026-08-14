@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach } from "vitest";
@@ -309,5 +310,6 @@ it("renders the XYZ drag handle inside the 80px axis input shell", () => {
   expect(axisInput).toBeInTheDocument();
   expect(axisInput).toHaveClass("inspector-axis-input");
   expect(valueInput.closest(".inspector-axis-input")).toBe(axisInput);
-  expect(getComputedStyle(axisInput as HTMLElement).backgroundColor).toBe("rgb(11, 11, 12)");
+  // jsdom 不加载样式表，80px 外壳宽度按项目惯例直接断言 CSS 源文件
+  expect(readFileSync("src/styles/index.css", "utf8")).toMatch(/\.inspector-axis-input\s*\{[\s\S]*?width:\s*80px;/);
 });

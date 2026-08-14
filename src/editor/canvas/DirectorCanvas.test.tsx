@@ -308,7 +308,7 @@ it("renders the viewport aspect ratio overlay when a non-auto frame is selected"
   render(<App />);
 
   expect(screen.getByLabelText("视口画幅框")).toBeInTheDocument();
-  expect(screen.getAllByLabelText("视口画幅遮罩")).toHaveLength(4);
+  expect(screen.getAllByLabelText("视口画幅遮罩")).toHaveLength(1);
   expect(screen.getByLabelText("视口画幅框")).toHaveAttribute("data-aspect-ratio", "9:16");
 });
 

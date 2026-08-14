@@ -13,6 +13,77 @@ vi.mock("../loaders/localModelImport", () => ({
   readLocalModelFile: (...args: unknown[]) => mockReadLocalModelFile(...args),
 }));
 
+// 模型库资产目录（模型库/）不在仓库内，catalog 的 import.meta.glob 在测试环境解析为空。
+// 用假条目 mock 掉 glob，保留对"面板渲染 → 添加模型入场景"逻辑的验证。
+type FakeLibraryItem = {
+  categoryId: string;
+  fileName: string;
+  id: string;
+  name: string;
+  thumbUrl: string;
+  url: string;
+};
+
+const fakeLibraryItems = vi.hoisted((): FakeLibraryItem[] => [
+  {
+    categoryId: "convenience",
+    fileName: "ATM_low.fbx",
+    id: "convenience:ATM_low.fbx",
+    name: "自动取款机",
+    thumbUrl: "/模型库/便利生活/缩略图/自动取款机.png",
+    url: "/模型库/便利生活/ATM_low.fbx",
+  },
+  {
+    categoryId: "outdoor",
+    fileName: "backpack_low.fbx",
+    id: "outdoor:backpack_low.fbx",
+    name: "背包",
+    thumbUrl: "/模型库/户外出行/缩略图/背包.png",
+    url: "/模型库/户外出行/backpack_low.fbx",
+  },
+  {
+    categoryId: "outdoor",
+    fileName: "thermus_low.fbx",
+    id: "outdoor:thermus_low.fbx",
+    name: "保温瓶",
+    thumbUrl: "/模型库/户外出行/缩略图/保温瓶.png",
+    url: "/模型库/户外出行/thermus_low.fbx",
+  },
+  {
+    categoryId: "outdoor",
+    fileName: "deer_skull_low.fbx",
+    id: "outdoor:deer_skull_low.fbx",
+    name: "鹿头骨",
+    thumbUrl: "/模型库/户外出行/缩略图/鹿头骨.png",
+    url: "/模型库/户外出行/deer_skull_low.fbx",
+  },
+  {
+    categoryId: "tools",
+    fileName: "wrench_low.fbx",
+    id: "tools:wrench_low.fbx",
+    name: "扳手",
+    thumbUrl: "/模型库/工具配件/缩略图/扳手.png",
+    url: "/模型库/工具配件/wrench_low.fbx",
+  },
+  {
+    categoryId: "tools",
+    fileName: "drill_press_low.fbx",
+    id: "tools:drill_press_low.fbx",
+    name: "台钻",
+    thumbUrl: "/模型库/工具配件/缩略图/台钻.png",
+    url: "/模型库/工具配件/drill_press_low.fbx",
+  },
+]);
+
+vi.mock("../modelLibrary/modelLibraryCatalog", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../modelLibrary/modelLibraryCatalog")>();
+
+  return {
+    ...actual,
+    getModelLibraryItems: () => fakeLibraryItems as ReturnType<typeof actual.getModelLibraryItems>,
+  };
+});
+
 function createMemoryStorage(): Storage {
   const storage = new Map<string, string>();
 
