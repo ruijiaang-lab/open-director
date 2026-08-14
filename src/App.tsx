@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { X } from "lucide-react";
 import { DirectorDeskShell } from "./app/layout/DirectorDeskShell";
 import { DirectorCanvas } from "./editor/canvas/DirectorCanvas";
+import { DirectorAssistantPanel } from "./editor/agent/DirectorAssistantPanel";
 import { initDirectorDeskHostBridge } from "./editor/io/hostBridge";
 import { useDirectorStore } from "./editor/store/directorStore";
 
@@ -97,6 +98,7 @@ export default function App() {
       <DirectorDeskShell>
         <DirectorCanvas />
       </DirectorDeskShell>
+      <DirectorAssistantPanel />
     </div>
   );
 }
