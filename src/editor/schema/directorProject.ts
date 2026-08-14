@@ -85,6 +85,39 @@ export interface DirectorCameraCapture {
   dataUrl: string;
 }
 
+/**
+ * 运镜节点：K 键掌镜时记录的相机姿态。
+ * rotation 为四元数 [x, y, z, w]（避免欧拉插值歧义）。
+ */
+export interface CameraNode {
+  id: string;
+  position: [number, number, number];
+  rotation: [number, number, number, number];
+  fov: number;
+  /** 时间轴位置（秒），即该节点出段（outgoing segment）的起始时间。由 Timeline 拖拽维护。 */
+  time: number;
+}
+
+export type CameraSegmentCurveMode = "linear" | "bezier";
+export type CameraSegmentEasing = "linear" | "ease-in" | "ease-out" | "ease-in-out";
+
+/**
+ * 相邻两个运镜节点之间的一段运动。
+ * duration = 运动时长；holdAfter = 运动结束后停在终点的停顿时长。
+ * 节点时间满足：node[i+1].time = node[i].time + duration + holdAfter。
+ */
+export interface CameraSegment {
+  id: string;
+  fromNodeId: string;
+  toNodeId: string;
+  curveMode: CameraSegmentCurveMode;
+  duration: number;
+  holdAfter: number;
+  easing: CameraSegmentEasing;
+  handleOut?: [number, number, number];
+  handleIn?: [number, number, number];
+}
+
 export interface DirectorCameraShot {
   id: string;
   name: string;
@@ -95,6 +128,10 @@ export interface DirectorCameraShot {
   target: [number, number, number];
   lastCaptureUrl?: string | null;
   captures?: DirectorCameraCapture[];
+  /** 运镜路径节点（可空 = 该机位尚无运镜记录） */
+  nodes?: CameraNode[];
+  /** 相邻节点之间的运动段（与 nodes 保持同步，缺失时按节点时间派生） */
+  segments?: CameraSegment[];
 }
 
 export interface DirectorProject {

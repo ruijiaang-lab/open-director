@@ -18,6 +18,8 @@ import { useDirectorStore } from "../store/directorStore";
 const VIEWER_ZOOM_MIN = 0.25;
 const VIEWER_ZOOM_MAX = 5;
 const VIEWER_ZOOM_STEP = 0.25;
+const CAMERA_FOV_MIN = 10;
+const CAMERA_FOV_MAX = 120;
 
 function replaceAxis(tuple: [number, number, number], axis: 0 | 1 | 2, value: number): [number, number, number] {
   return tuple.map((item, index) => (index === axis ? value : item)) as [number, number, number];
@@ -31,6 +33,7 @@ export function CameraPanel() {
   const [viewerScale, setViewerScale] = useState(1);
   const [viewerOffset, setViewerOffset] = useState({ x: 0, y: 0 });
   const [viewerDragging, setViewerDragging] = useState(false);
+  const [fovDraft, setFovDraft] = useState<string | null>(null);
   const viewerDragStateRef = useRef<{
     startX: number;
     startY: number;
@@ -256,6 +259,33 @@ export function CameraPanel() {
       targetMode: "manual",
       targetObjectId: null,
       target: replaceAxis(currentCamera.target, axis, Number(value)),
+    });
+  }
+
+  function updateFovFromRange(value: string) {
+    const nextFov = Number(value);
+    if (!Number.isFinite(nextFov)) return;
+    setFovDraft(null);
+    updateCamera(currentCamera.id, {
+      fov: Math.min(CAMERA_FOV_MAX, Math.max(CAMERA_FOV_MIN, nextFov)),
+    });
+  }
+
+  function updateFovWhileTyping(value: string) {
+    setFovDraft(value);
+    if (value.trim() === "") return;
+    const nextFov = Number(value);
+    if (!Number.isFinite(nextFov) || nextFov < CAMERA_FOV_MIN || nextFov > CAMERA_FOV_MAX) return;
+    updateCamera(currentCamera.id, { fov: nextFov });
+  }
+
+  function commitFovInput(value: string) {
+    const nextFov = Number(value);
+    setFovDraft(null);
+    updateCamera(currentCamera.id, {
+      fov: value.trim() !== "" && Number.isFinite(nextFov)
+        ? Math.min(CAMERA_FOV_MAX, Math.max(CAMERA_FOV_MIN, nextFov))
+        : currentCamera.fov,
     });
   }
 
@@ -579,8 +609,10 @@ export function CameraPanel() {
             max="120"
             min="10"
             step="0.1"
-            value={currentCamera.fov}
-            onValueChange={(value) => updateCamera(currentCamera.id, { fov: Number(value) })}
+            value={fovDraft ?? currentCamera.fov}
+            onValueChange={updateFovFromRange}
+            onNumberChange={updateFovWhileTyping}
+            onNumberBlur={commitFovInput}
           />
           <InspectorSection title="相机截图" className="camera-capture-section">
             <button

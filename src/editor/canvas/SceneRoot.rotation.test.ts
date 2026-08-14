@@ -74,12 +74,13 @@ function getUniquePoints(points: Array<[number, number, number]>) {
   return Array.from(new Map(points.map((point) => [point.join(","), point])).values());
 }
 
-it("uses a smaller fixed 16:9 front viewfinder with a longer depth", () => {
+it("uses the configured vertical FOV for the 16:9 camera viewfinder", () => {
   const metrics = getFrustumMetrics({});
+  const expectedHalfHeight = Math.tan((50 / 2) * (Math.PI / 180)) * metrics.maxDepth;
 
   expect(metrics.maxDepth).toBeCloseTo(5.2 * VIEWPORT_CAMERA_VISUAL_SCALE);
-  expect(metrics.maxHalfWidth).toBeCloseTo(1.6 * VIEWPORT_CAMERA_VISUAL_SCALE);
-  expect(metrics.maxHalfHeight).toBeCloseTo(0.9 * VIEWPORT_CAMERA_VISUAL_SCALE);
+  expect(metrics.maxHalfHeight).toBeCloseTo(expectedHalfHeight);
+  expect(metrics.maxHalfWidth).toBeCloseTo(expectedHalfHeight * (16 / 9));
   expect(metrics.maxHalfWidth / metrics.maxHalfHeight).toBeCloseTo(16 / 9);
 });
 
@@ -92,11 +93,11 @@ it("keeps the viewport camera viewfinder length fixed when the shot target dista
   expect(farMetrics.maxDepth).toBeCloseTo(defaultMetrics.maxDepth);
 });
 
-it("keeps the viewport camera viewfinder size fixed when fov changes", () => {
+it("widens the viewport camera viewfinder when fov increases", () => {
   const narrowMetrics = getFrustumMetrics({ fov: 35 });
   const wideMetrics = getFrustumMetrics({ fov: 75 });
 
-  expect(wideMetrics.maxHalfWidth).toBeCloseTo(narrowMetrics.maxHalfWidth);
+  expect(wideMetrics.maxHalfWidth).toBeGreaterThan(narrowMetrics.maxHalfWidth);
 });
 
 it("keeps the opaque viewport camera model behind the shot origin", () => {

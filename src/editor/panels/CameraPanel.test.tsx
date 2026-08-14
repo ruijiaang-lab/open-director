@@ -155,6 +155,24 @@ it("updates the selected camera name and fov", async () => {
   expect(camera.fov).toBe(65);
 });
 
+it("does not write transient invalid FOV values while typing and clamps on blur", () => {
+  render(<CameraPanel />);
+  const fovInput = screen.getByLabelText("机位 FOV");
+
+  fireEvent.change(fovInput, { target: { value: "" } });
+  expect(useDirectorStore.getState().project.cameras[0].fov).toBe(50);
+
+  fireEvent.change(fovInput, { target: { value: "6" } });
+  expect(useDirectorStore.getState().project.cameras[0].fov).toBe(50);
+
+  fireEvent.change(fovInput, { target: { value: "65" } });
+  expect(useDirectorStore.getState().project.cameras[0].fov).toBe(65);
+
+  fireEvent.change(fovInput, { target: { value: "140" } });
+  fireEvent.blur(fovInput);
+  expect(useDirectorStore.getState().project.cameras[0].fov).toBe(120);
+});
+
 it("uses the custom dropdown menu to switch camera shots", async () => {
   const user = userEvent.setup();
   useDirectorStore.getState().addCameraShot();

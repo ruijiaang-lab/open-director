@@ -491,7 +491,8 @@ it("shows transform controls around the selected character in the active tool mo
   expect(screen.getByTestId("transform-controls")).toHaveAttribute("data-translation-snap", "null");
 });
 
-it("shows transform controls around selected models while in camera view", () => {
+it("hides transform controls in camera view so shot cameras only see the scene", () => {
+  // 验收 #9：机位视角中不能出现编辑 Gizmo，只渲染场景本身
   useDirectorStore.setState({
     ...useDirectorStore.getState(),
     viewMode: "camera",
@@ -501,9 +502,7 @@ it("shows transform controls around selected models while in camera view", () =>
 
   render(<SceneRoot />);
 
-  expect(screen.getByTestId("transform-controls")).toHaveAttribute("data-mode", "scale");
-  expect(screen.getByTestId("transform-controls")).toHaveAttribute("data-has-object", "true");
-  expect(screen.getByTestId("transform-controls")).toHaveAttribute("data-translation-snap", "null");
+  expect(screen.queryByTestId("transform-controls")).toBeNull();
 });
 
 it("selects the whole crowd group and shows one transform control when users click a crowd member", () => {

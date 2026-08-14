@@ -14,7 +14,6 @@ import type {
 import {
   VIEWPORT_CAMERA_ASPECT,
   VIEWPORT_CAMERA_FRUSTUM_DEPTH,
-  VIEWPORT_CAMERA_FRUSTUM_FRAME_WIDTH,
   VIEWPORT_CAMERA_VISUAL_SCALE,
 } from "../schema/cameraGeometry";
 import { VIEWPORT_OBJECT_LABEL_VERTICAL_GAP } from "../schema/viewportLabels";
@@ -25,6 +24,7 @@ import { getGroundedLabelY } from "../runtime/mannequin/bodyTypes";
 import { getUE4GroundedLabelY } from "../runtime/ue4Mannequin/ue4MannequinRig";
 import { getEffectiveGroundOpacity } from "./panoramaMath";
 import { getCrowdAnchorTransform } from "../store/directorStore";
+import { CameraPathOverlay } from "./CameraPathOverlay";
 
 export { getEffectiveGroundOpacity, getPanoramaRotationRadians } from "./panoramaMath";
 
@@ -608,11 +608,12 @@ function CrowdTransformRig({
 }
 
 export function getViewportCameraFrustumLines(
-  _camera: DirectorCameraShot
+  camera: DirectorCameraShot
 ): Array<[[number, number, number], [number, number, number]]> {
   const frameDepth = VIEWPORT_CAMERA_FRUSTUM_DEPTH;
-  const halfWidth = VIEWPORT_CAMERA_FRUSTUM_FRAME_WIDTH / 2;
-  const halfHeight = VIEWPORT_CAMERA_FRUSTUM_FRAME_WIDTH / VIEWPORT_CAMERA_ASPECT / 2;
+  const safeVerticalFov = Math.min(179, Math.max(1, camera.fov));
+  const halfHeight = Math.tan((safeVerticalFov * Math.PI) / 360) * frameDepth;
+  const halfWidth = halfHeight * VIEWPORT_CAMERA_ASPECT;
   const topLeft: [number, number, number] = [-halfWidth, halfHeight, frameDepth];
   const topRight: [number, number, number] = [halfWidth, halfHeight, frameDepth];
   const bottomRight: [number, number, number] = [halfWidth, -halfHeight, frameDepth];
@@ -823,7 +824,7 @@ export function SceneRoot() {
               selected={item.crowdId ? false : item.id === selectedObjectId}
               showLabels={scene.showLabels}
               transformMode={transformMode}
-              transformable={!item.locked}
+              transformable={!item.locked && viewMode === "director"}
               translationSnap={translationSnap}
               onSelect={handleObjectSelect}
             />
@@ -837,7 +838,7 @@ export function SceneRoot() {
             objects={objects}
             selected={selectedCrowdId === crowdId}
             transformMode={transformMode}
-            transformable={!(crowdLocksById.get(crowdId) ?? false)}
+            transformable={!(crowdLocksById.get(crowdId) ?? false) && viewMode === "director"}
             translationSnap={translationSnap}
           />
         )
@@ -859,6 +860,7 @@ export function SceneRoot() {
               />
             ))
         : null}
+      <CameraPathOverlay />
     </group>
   );
 }

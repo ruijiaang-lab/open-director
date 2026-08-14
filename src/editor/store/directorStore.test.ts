@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, vi } from "vitest";
 import { createDefaultDirectorProject, createInitialDirectorState, useDirectorStore } from "./directorStore";
 import { selectRightPanelKind } from "./directorSelectors";
-import { getCameraRigPositionFromViewSnapshot } from "../schema/cameraGeometry";
+import { VIEWPORT_CAMERA_FRUSTUM_DEPTH, getCameraRigPositionFromViewSnapshot } from "../schema/cameraGeometry";
+import { getDirectorObjectFocusTarget } from "../schema/cameraTarget";
 
 function createMemoryStorage(): Storage {
   const storage = new Map<string, string>();
@@ -648,4 +649,137 @@ it("groups repeated transform updates into one undo step while batching", () => 
   expect(useDirectorStore.getState().project.objects.find((item) => item.id === "char_default_a")?.transform.position).toEqual([
     0, 0, 0,
   ]);
+});
+
+describe("recordCameraNode", () => {
+  it("appends a camera node to the active camera with sequential ids and times", () => {
+    useDirectorStore.getState().recordCameraNode("cam_1", {
+      position: [0, 1.55, 5.4],
+      rotation: [0, 0, 0, 1],
+      fov: 50,
+    });
+    useDirectorStore.getState().recordCameraNode("cam_1", {
+      position: [1, 1.55, 4],
+      rotation: [0, 0, 0, 1],
+      fov: 50,
+    });
+
+    const nodes = useDirectorStore.getState().project.cameras.find((item) => item.id === "cam_1")?.nodes ?? [];
+
+    expect(nodes.map((item) => item.id)).toEqual(["node_1", "node_2"]);
+    expect(nodes.map((item) => item.time)).toEqual([0, 1]);
+    expect(nodes[0].position).toEqual([0, 1.55, 5.4]);
+    expect(nodes[0].rotation).toEqual([0, 0, 0, 1]);
+    expect(nodes[0].fov).toBe(50);
+  });
+
+  it("writes the camera rig transform behind the view point and updates the target", () => {
+    useDirectorStore.getState().recordCameraNode("cam_1", {
+      position: [0, 1.55, 5.4],
+      rotation: [0, 0, 0, 1],
+      fov: 50,
+    });
+
+    const camera = useDirectorStore.getState().project.cameras.find((item) => item.id === "cam_1");
+    const rig = camera?.transform.position ?? [];
+
+    // 视点沿 -Z 后退一个视锥深度 = rig 位置
+    expect(rig[0]).toBeCloseTo(0, 5);
+    expect(rig[1]).toBeCloseTo(1.55, 5);
+    expect(rig[2]).toBeCloseTo(5.4 + VIEWPORT_CAMERA_FRUSTUM_DEPTH, 5);
+
+    // target 更新为"当前注视点"：视点 + 朝向 × 原视点-目标距离
+    const radius = Math.hypot(0.5, 5.4);
+    expect(camera?.target[0]).toBeCloseTo(0, 5);
+    expect(camera?.target[1]).toBeCloseTo(1.55, 5);
+    expect(camera?.target[2]).toBeCloseTo(5.4 - radius, 5);
+
+    expect(camera?.transform.rotation).toEqual([0, 0, 0]);
+  });
+
+  it("keeps the camera object gizmo in sync with the rig transform", () => {
+    useDirectorStore.getState().recordCameraNode("cam_1", {
+      position: [0, 1.55, 5.4],
+      rotation: [0, 0, 0, 1],
+      fov: 50,
+    });
+
+    const cameraObject = useDirectorStore
+      .getState()
+      .project.objects.find((item) => item.kind === "camera" && item.linkedCameraId === "cam_1");
+
+    expect(cameraObject?.transform.position).toEqual(
+      useDirectorStore.getState().project.cameras.find((item) => item.id === "cam_1")?.transform.position
+    );
+  });
+
+  it("converts a yawed quaternion into the matching rig position and euler rotation", () => {
+    useDirectorStore.getState().recordCameraNode("cam_1", {
+      position: [0, 1.55, 5.4],
+      rotation: [0, Math.SQRT1_2, 0, Math.SQRT1_2], // yaw 90°
+      fov: 50,
+    });
+
+    const camera = useDirectorStore.getState().project.cameras.find((item) => item.id === "cam_1");
+    const rig = camera?.transform.position ?? [];
+
+    // forward = (-1, 0, 0)，rig = 视点 + forward * depth = 视点 + (1.82, 0, 0)
+    expect(rig[0]).toBeCloseTo(VIEWPORT_CAMERA_FRUSTUM_DEPTH, 5);
+    expect(rig[1]).toBeCloseTo(1.55, 5);
+    expect(rig[2]).toBeCloseTo(5.4, 5);
+    expect(camera?.transform.rotation[1]).toBeCloseTo(Math.PI / 2, 5);
+  });
+
+  it("undoes a recorded node", () => {
+    useDirectorStore.getState().recordCameraNode("cam_1", {
+      position: [0, 1.55, 5.4],
+      rotation: [0, 0, 0, 1],
+      fov: 50,
+    });
+
+    expect(useDirectorStore.getState().project.cameras.find((item) => item.id === "cam_1")?.nodes).toHaveLength(1);
+
+    useDirectorStore.getState().undo();
+
+    const camera = useDirectorStore.getState().project.cameras.find((item) => item.id === "cam_1");
+    expect(camera?.nodes).toBeUndefined();
+    expect(camera?.transform.position).toEqual(
+      createDefaultDirectorProject().cameras[0].transform.position
+    );
+  });
+});
+
+describe("syncCameraPose", () => {
+  it("updates the camera rig transform and target without recording a node", () => {
+    useDirectorStore.getState().syncCameraPose("cam_1", {
+      position: [0, 1.55, 5.4],
+      rotation: [0, 0, 0, 1],
+      fov: 50,
+    });
+
+    const camera = useDirectorStore.getState().project.cameras.find((item) => item.id === "cam_1");
+    expect(camera?.nodes ?? []).toHaveLength(0);
+    expect(camera?.transform.position[2]).toBeCloseTo(5.4 + VIEWPORT_CAMERA_FRUSTUM_DEPTH, 5);
+  });
+
+  it("preserves the real object target while syncing a tracked camera pose", () => {
+    const targetObject = useDirectorStore.getState().project.objects.find((item) => item.id === "char_default_a");
+    expect(targetObject).toBeTruthy();
+
+    useDirectorStore.getState().updateCamera("cam_1", {
+      targetMode: "object",
+      targetObjectId: targetObject!.id,
+      target: [9, 9, 9],
+    });
+    useDirectorStore.getState().syncCameraPose("cam_1", {
+      position: [3, 2, 6],
+      rotation: [0, 0, 0, 1],
+      fov: 50,
+    });
+
+    const camera = useDirectorStore.getState().project.cameras.find((item) => item.id === "cam_1");
+    expect(camera?.targetMode).toBe("object");
+    expect(camera?.targetObjectId).toBe(targetObject!.id);
+    expect(camera?.target).toEqual(getDirectorObjectFocusTarget(targetObject!));
+  });
 });

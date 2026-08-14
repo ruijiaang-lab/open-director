@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { ObjectTreePanel } from "../../editor/panels/ObjectTreePanel";
 import { RightPanel } from "../../editor/panels/RightPanel";
+import { DirectorTimeline } from "../../editor/timeline/DirectorTimeline";
 import { useDirectorStore } from "../../editor/store/directorStore";
 
 export function DirectorDeskShell({ children }: { children: ReactNode }) {
@@ -27,6 +28,7 @@ export function DirectorDeskShell({ children }: { children: ReactNode }) {
       >
         <RightPanel />
       </aside>
+      <DirectorTimeline />
     </div>
   );
 }

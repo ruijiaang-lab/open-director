@@ -1,5 +1,5 @@
 import { GizmoHelper, GizmoViewport, Grid, OrbitControls, PerspectiveCamera } from "@react-three/drei";
-import { Canvas, useThree } from "@react-three/fiber";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import {
   Suspense,
   useCallback,
@@ -16,6 +16,7 @@ import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import { clearViewportCaptureHandler, setViewportCaptureHandler } from "../io/captureBridge";
 import { buildScreenshotMeta, type ScreenshotResult } from "../io/screenshotExport";
 import { useDirectorStore, type CameraShotSnapshot } from "../store/directorStore";
+import { CameraFPSControls } from "../controls/CameraFPSControls";
 import { DEFAULT_DIRECTOR_CAMERA_VIEW_SNAPSHOT, getCameraViewSnapshotFromShot } from "../schema/cameraGeometry";
 import type { DirectorObject, DirectorTransform, SceneSettings } from "../schema/directorProject";
 import { getGroundedLabelY } from "../runtime/mannequin/bodyTypes";
@@ -25,6 +26,8 @@ import { ViewportAspectOverlay } from "./ViewportAspectOverlay";
 import { ViewportBackground } from "./ViewportBackground";
 import { ViewportToolbar } from "./ViewportToolbar";
 import { getViewportAspectFrameRect, type ViewportSafeAreaInsets } from "./viewportAspectFrame";
+import { CameraPlaybackController } from "./CameraPlaybackController";
+import { useCameraPlaybackStore } from "../store/cameraPlaybackStore";
 
 export const DEFAULT_DIRECTOR_VIEW_SNAPSHOT: CameraShotSnapshot = DEFAULT_DIRECTOR_CAMERA_VIEW_SNAPSHOT;
 const VIEWPORT_FRAME_PADDING = 40;
@@ -504,6 +507,36 @@ function DirectorViewCameraSync({
   return null;
 }
 
+/**
+ * 机位视角下每帧把相机实时姿态（含掌镜移动/转动）写入 ref，
+ * 供"添加机位"等操作取用——否则新机位永远复制导演视角，切机位看不出区别。
+ */
+function ViewportCameraPoseBridge({
+  activeCamera,
+  onPose,
+}: {
+  activeCamera: { target: [number, number, number] };
+  onPose: (snapshot: CameraShotSnapshot) => void;
+}) {
+  const { camera } = useThree();
+
+  useFrame(() => {
+    const perspectiveCamera = camera as ThreePerspectiveCamera;
+    const position = perspectiveCamera.position;
+    const forward = new Vector3(0, 0, -1).applyQuaternion(perspectiveCamera.quaternion);
+    const radius = Math.max(new Vector3(...activeCamera.target).distanceTo(position), 0.001);
+    const target = position.clone().add(forward.multiplyScalar(radius));
+
+    onPose({
+      fov: perspectiveCamera.fov,
+      position: toSnapshotTuple(position),
+      target: toSnapshotTuple(target),
+    });
+  });
+
+  return null;
+}
+
 function ViewportGizmoContent({
   onSnapshotChange,
   snapshot,
@@ -588,14 +621,22 @@ export function DirectorCanvas() {
   const sceneSettings = useDirectorStore((state) => state.project.scene);
   const assets = useDirectorStore((state) => state.project.assets);
   const panoramaAssetId = useDirectorStore((state) => state.project.panoramaAssetId);
-  const activeCamera = useDirectorStore((state) =>
-    state.project.cameras.find((item) => item.id === state.project.activeCameraId)
-  );
+  // 分开订阅：setActiveCamera 只改 activeCameraId，cameras 数组不变时
+  // find 返回同一引用会被 Zustand 判定为"无变化"而不重渲染，机位切换就失效了
+  const activeCameraId = useDirectorStore((state) => state.project.activeCameraId);
+  const cameras = useDirectorStore((state) => state.project.cameras);
+  const activeCamera = cameras.find((item) => item.id === activeCameraId);
+  const isPlaying = useCameraPlaybackStore((state) => state.isPlaying);
+  const selectedNode = useCameraPlaybackStore((state) => state.selectedNode);
+  const kAction = selectedNode?.cameraId === activeCamera?.id ? "更新选中节点视角" : "更新临近镜头视角 / 新建节点";
   const controlsRef = useRef<OrbitControlsImpl | null>(null);
   const toolbarRef = useRef<HTMLDivElement | null>(null);
   const viewportCameraSnapshotRef = useRef<CameraShotSnapshot>(DEFAULT_DIRECTOR_VIEW_SNAPSHOT);
+  const viewportCameraPoseRef = useRef<CameraShotSnapshot | null>(null);
   const [directorViewSnapshot, setDirectorViewSnapshot] = useState(DEFAULT_DIRECTOR_VIEW_SNAPSHOT);
   const [toolbarHeight, setToolbarHeight] = useState(DEFAULT_VIEWPORT_TOOLBAR_HEIGHT);
+  const [fpsLocked, setFpsLocked] = useState(false);
+  const fpsLookedAtCameraIdRef = useRef<string | null>(null);
   const hasPanorama = Boolean(panoramaAssetId);
   const panoramaAsset = assets.find((item) => item.id === panoramaAssetId);
   const showViewportGrid = shouldRenderViewportGrid(hasPanorama, sceneSettings.snapToGrid);
@@ -640,7 +681,34 @@ export function DirectorCanvas() {
     };
   }, []);
 
+  useEffect(() => {
+    const handleSpaceToggle = (event: KeyboardEvent) => {
+      if (event.code !== "Space") return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) {
+        return;
+      }
+      event.preventDefault();
+      // 从机位视角切走时必须先释放鼠标锁定，否则指针锁在浏览器里导致 UI 无法操作
+      if (viewMode === "camera" && document.pointerLockElement) {
+        document.exitPointerLock?.();
+      }
+      // 播放中离开镜头画面 = 结束预览，回导演视角时自动暂停
+      if (viewMode === "camera" && useCameraPlaybackStore.getState().isPlaying) {
+        useCameraPlaybackStore.getState().pause();
+      }
+      setViewMode(viewMode === "camera" ? "director" : "camera");
+    };
+
+    window.addEventListener("keydown", handleSpaceToggle);
+    return () => window.removeEventListener("keydown", handleSpaceToggle);
+  }, [setViewMode, viewMode]);
+
   function getViewportCameraSnapshot(): CameraShotSnapshot {
+    // 机位视角下优先取相机实时姿态（含掌镜移动/转动），导演视角取 OrbitControls 快照
+    if (viewMode === "camera" && viewportCameraPoseRef.current) {
+      return viewportCameraPoseRef.current;
+    }
     return viewportCameraSnapshotRef.current;
   }
 
@@ -667,7 +735,7 @@ export function DirectorCanvas() {
         <Canvas
           camera={{ position: DEFAULT_DIRECTOR_VIEW_SNAPSHOT.position, fov: DEFAULT_DIRECTOR_VIEW_SNAPSHOT.fov }}
           gl={{ antialias: true, preserveDrawingBuffer: true }}
-          onPointerMissed={openSceneInspector}
+          onPointerMissed={viewMode === "camera" ? undefined : openSceneInspector}
           onCreated={({ camera }) => {
             const perspectiveCamera = camera as ThreePerspectiveCamera;
             perspectiveCamera.lookAt(...DEFAULT_DIRECTOR_VIEW_SNAPSHOT.target);
@@ -717,14 +785,39 @@ export function DirectorCanvas() {
             />
           ) : null}
           <DirectorViewCameraSync controlsRef={controlsRef} snapshot={directorViewSnapshot} viewMode={viewMode} />
-          {viewMode === "camera" && activeCameraView ? (
-            <PerspectiveCamera
-              fov={activeCameraView.fov}
-              makeDefault
-              position={activeCameraView.position}
-              onUpdate={(camera) => camera.lookAt(...activeCameraView.target)}
-            />
+          {viewMode === "camera" && activeCamera ? (
+            <>
+              <PerspectiveCamera
+                fov={activeCameraView?.fov ?? activeCamera.fov}
+                makeDefault
+                position={activeCameraView?.position ?? activeCamera.transform.position}
+                onUpdate={(camera) => {
+                  // 明确刷新投影矩阵，确保属性面板的 FOV 变化立即进入真实取景相机。
+                  camera.updateProjectionMatrix();
+                  // 掌镜锁定期间由鼠标接管朝向，不重置 lookAt；
+                  // 但切换机位/播放期间必须强制看向机位目标，否则朝向停留在旧姿态
+                  if (
+                    activeCamera.targetMode === "object" ||
+                    isPlaying ||
+                    !fpsLocked ||
+                    fpsLookedAtCameraIdRef.current !== activeCamera.id
+                  ) {
+                    fpsLookedAtCameraIdRef.current = activeCamera.id;
+                    camera.lookAt(...activeCamera.target);
+                  }
+                  camera.updateMatrixWorld();
+                }}
+              />
+              <ViewportCameraPoseBridge
+                activeCamera={activeCamera}
+                onPose={(snapshot) => {
+                  viewportCameraPoseRef.current = snapshot;
+                }}
+              />
+            </>
           ) : null}
+          {viewMode === "camera" && activeCamera ? <CameraFPSControls onLockChange={setFpsLocked} /> : null}
+          <CameraPlaybackController />
           <CanvasCaptureBridge
             activeCamera={activeCamera}
             bottomPadding={aspectOverlayBottomPadding}
@@ -750,6 +843,30 @@ export function DirectorCanvas() {
         rightOffset={gizmoRightOffset}
         snapshot={visibleViewportSnapshot}
       />
+      {viewMode === "camera" && activeCamera ? (
+        <div
+          className="camera-fps-hint"
+          style={{
+            position: "absolute",
+            left: "50%",
+            bottom: `${aspectOverlayBottomPadding}px`,
+            transform: "translateX(-50%)",
+            padding: "8px 16px",
+            borderRadius: 999,
+            background: "rgba(20, 24, 34, 0.85)",
+            color: "var(--text-rgb, 255 255 255)",
+            fontSize: 12,
+            lineHeight: "18px",
+            whiteSpace: "nowrap",
+            pointerEvents: "none",
+            zIndex: 10,
+          }}
+        >
+          {fpsLocked
+            ? `${activeCamera?.name} · WASD 移动 · Q/E 升降 · Shift 加速 · K ${kAction}（已记录 ${activeCamera?.nodes?.length ?? 0} 个）· Esc 释放鼠标`
+            : `${activeCamera?.name} · 点击画面进入掌镜模式 · WASD 移动 · K ${kAction} · Space 切回导演视角`}
+        </div>
+      ) : null}
       <ViewportToolbar getViewportCameraSnapshot={getViewportCameraSnapshot} toolbarContainerRef={toolbarRef} />
     </div>
   );

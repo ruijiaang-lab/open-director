@@ -129,6 +129,8 @@ export function ViewportToolbar({
   const addCameraShot = useDirectorStore((state) => state.addCameraShot);
   const addCameraCaptures = useDirectorStore((state) => state.addCameraCaptures);
   const activeCameraId = useDirectorStore((state) => state.project.activeCameraId);
+  const cameras = useDirectorStore((state) => state.project.cameras);
+  const setActiveCamera = useDirectorStore((state) => state.setActiveCamera);
   const viewMode = useDirectorStore((state) => state.viewMode);
   const transformMode = useDirectorStore((state) => state.transformMode);
   const viewportAspectRatio = useDirectorStore((state) => state.viewportAspectRatio);
@@ -501,6 +503,41 @@ export function ViewportToolbar({
   return (
     <>
       <div className="viewport-toolbar" role="group" aria-label="3D视口快捷工具" ref={setToolbarElement}>
+        <button
+          aria-label={viewMode === "camera" ? "切换到导演视角" : "切换到机位视角"}
+          className={`ui-icon-button viewport-toolbar-button${viewMode === "camera" ? " is-active" : ""}`}
+          type="button"
+          onClick={() => setViewMode(viewMode === "camera" ? "director" : "camera")}
+        >
+          <Camera aria-hidden="true" size={17} strokeWidth={1.9} />
+          <span className="viewport-toolbar-label">{viewMode === "camera" ? "导演视角" : "机位视角"}</span>
+        </button>
+        {cameras.length > 0 ? (
+          <select
+            aria-label="切换机位"
+            className="viewport-toolbar-camera-select"
+            style={{
+              background: "var(--panel-rgb, 26 26 26)",
+              color: "var(--text-rgb, 255 255 255)",
+              border: "1px solid rgba(255, 255, 255, 0.15)",
+              borderRadius: 6,
+              fontSize: 12,
+              height: 30,
+              padding: "0 6px",
+            }}
+            value={activeCameraId ?? ""}
+            onChange={(event) => {
+              setActiveCamera(event.target.value);
+              setViewMode("camera");
+            }}
+          >
+            {cameras.map((camera) => (
+              <option key={camera.id} value={camera.id}>
+                {camera.name}
+              </option>
+            ))}
+          </select>
+        ) : null}
         {actions.slice(0, 3).map(renderActionButton)}
         <div className="viewport-toolbar-menu-wrap">
           <button

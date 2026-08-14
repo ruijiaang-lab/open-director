@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { Euler, Quaternion, Vector3 } from "three";
 import { MANNEQUIN_POSE_PRESETS } from "../presets/mannequinPosePresets";
 import { GEOMETRY_PRIMITIVE_OPTIONS } from "../schema/directorProject";
 import type {
@@ -6,6 +7,8 @@ import type {
   DirectorAssetSource,
   CharacterBodyType,
   DirectorAssetKind,
+  CameraNode,
+  CameraSegment,
   DirectorCameraCapture,
   DirectorCameraShot,
   DirectorObject,
@@ -18,10 +21,20 @@ import type {
 } from "../schema/directorProject";
 import type { PosePresetId } from "../schema/poseSchema";
 import { getDirectorObjectFocusTarget } from "../schema/cameraTarget";
+import { VIEWPORT_CAMERA_FRUSTUM_DEPTH } from "../schema/cameraGeometry";
+import {
+  buildCameraSegments,
+  clampNodeTime,
+  getDefaultBezierHandles,
+  getLookAtQuaternion,
+  getNodeStartTimes,
+  MIN_SEGMENT_DURATION,
+} from "../camera/cameraPath";
 import { DEFAULT_CHARACTER_BODY_TYPE, normalizeBodyType } from "../runtime/mannequin/bodyTypes";
 import {
   DEFAULT_DIRECTOR_CAMERA_VIEW_SNAPSHOT,
   getCameraRigPositionFromViewSnapshot,
+  getCameraViewSnapshotFromShot,
 } from "../schema/cameraGeometry";
 import type { ViewportAspectRatio } from "../schema/viewportAspectRatio";
 
@@ -124,6 +137,53 @@ export interface DirectorActions {
   updateCrowdPoseControl: (crowdId: string, key: string, value: number) => void;
   setActiveCamera: (cameraId: string) => void;
   addCameraCaptures: (cameraId: string | null | undefined, dataUrls: string[]) => void;
+  /**
+   * 记录一个运镜节点到指定机位，并把机位 transform 同步为当前姿态。
+   * rotation 为四元数 [x, y, z, w]。
+   */
+  recordCameraNode: (
+    cameraId: string,
+    input: {
+      position: [number, number, number];
+      rotation: [number, number, number, number];
+      fov: number;
+    }
+  ) => void;
+  /** 只同步机位姿态（不记录节点）：离开机位视角时保留最后掌镜位置 */
+  syncCameraPose: (
+    cameraId: string,
+    input: {
+      position: [number, number, number];
+      rotation: [number, number, number, number];
+      fov: number;
+    }
+  ) => void;
+  /**
+   * 播放/scrub 时把求值出的姿态写回机位（视点位置 + 四元数）。
+   * 每帧调用：不进 undo 栈、不写 localStorage。
+   */
+  applyPlaybackPose: (
+    cameraId: string,
+    input: {
+      position: [number, number, number];
+      rotation: [number, number, number, number];
+      fov: number;
+    }
+  ) => void;
+  updateCameraNode: (
+    cameraId: string,
+    nodeId: string,
+    patch: Partial<Pick<CameraNode, "position" | "rotation" | "fov">>
+  ) => void;
+  updateCameraNodeTime: (cameraId: string, nodeId: string, time: number) => void;
+  addCameraNode: (cameraId: string, afterNodeId?: string) => void;
+  deleteCameraNode: (cameraId: string, nodeId: string) => void;
+  updateCameraSegment: (
+    cameraId: string,
+    segmentId: string,
+    patch: Partial<Pick<CameraSegment, "duration" | "holdAfter" | "easing" | "handleOut" | "handleIn">>
+  ) => void;
+  setSegmentCurveMode: (cameraId: string, segmentId: string, mode: CameraSegment["curveMode"]) => void;
   updateCamera: (
     cameraId: string,
     patch: Partial<DirectorCameraShot> & {
@@ -222,6 +282,90 @@ function createTransform(
   scale: [number, number, number] = [1, 1, 1]
 ): DirectorTransform {
   return { position, rotation, scale };
+}
+
+function eulerFromQuaternion(quaternion: [number, number, number, number]): [number, number, number] {
+  const euler = new Euler().setFromQuaternion(new Quaternion(...quaternion));
+  return roundTransformTuple([euler.x, euler.y, euler.z]);
+}
+
+/**
+ * 把相机姿态（视点位置 + 四元数）应用到机位：
+ * transform 存 rig 位置（视点沿朝向后退一个视锥深度），
+ * target 更新为"当前注视点"，保证重进 Camera View 时朝向一致。
+ * 同步机位配套的 gizmo 对象。
+ */
+function applyCameraPose(
+  state: DirectorRuntimeState,
+  cameraId: string,
+  input: { position: [number, number, number]; rotation: [number, number, number, number]; fov: number },
+  nodes: CameraNode[] | undefined
+): DirectorRuntimeState {
+  const camera = state.project.cameras.find((item) => item.id === cameraId);
+  if (!camera) return state;
+
+  const trackedTargetObject =
+    camera.targetMode === "object" && camera.targetObjectId
+      ? state.project.objects.find((item) => item.id === camera.targetObjectId)
+      : null;
+  const forward = new Vector3(0, 0, -1).applyQuaternion(new Quaternion(...input.rotation));
+  const viewPosition = new Vector3(...input.position);
+  const radius = Math.max(viewPosition.distanceTo(new Vector3(...camera.target)), 0.001);
+  const nextTarget = viewPosition.clone().add(forward.clone().multiplyScalar(radius));
+  const resolvedTarget = trackedTargetObject
+    ? getDirectorObjectFocusTarget(trackedTargetObject)
+    : roundTransformTuple([nextTarget.x, nextTarget.y, nextTarget.z]);
+  const rigPosition = viewPosition.clone().sub(forward.clone().multiplyScalar(VIEWPORT_CAMERA_FRUSTUM_DEPTH));
+  const transform: DirectorTransform = {
+    position: roundTransformTuple([rigPosition.x, rigPosition.y, rigPosition.z]),
+    rotation: eulerFromQuaternion(input.rotation),
+    scale: [1, 1, 1],
+  };
+
+  return {
+    ...state,
+    project: {
+      ...state.project,
+      cameras: state.project.cameras.map((item) =>
+        item.id === cameraId
+          ? {
+              ...item,
+              nodes,
+              fov: input.fov,
+              transform,
+              target: resolvedTarget,
+            }
+          : item
+      ),
+      objects: state.project.objects.map((item) =>
+        item.kind === "camera" && item.linkedCameraId === cameraId ? { ...item, transform } : item
+      ),
+    },
+  };
+}
+
+/** 用段表（duration/holdAfter 为准）反推各节点时间，保持 node.time 与段表一致。 */
+function syncNodeTimes(nodes: CameraNode[], segments: CameraSegment[]): CameraNode[] {
+  const startTimes = getNodeStartTimes(nodes, segments);
+
+  return nodes.map((node, index) => (node.time === startTimes[index] ? node : { ...node, time: startTimes[index] }));
+}
+
+/** 节点变化后重建段表（同 id 段保留设置），并同步节点时间。 */
+function rebuildCameraTiming(camera: DirectorCameraShot): DirectorCameraShot {
+  if (!camera.nodes || camera.nodes.length < 2) {
+    return camera.segments ? { ...camera, segments: [] } : camera;
+  }
+
+  const segments = buildCameraSegments(camera.nodes, camera.segments);
+  return { ...camera, segments, nodes: syncNodeTimes(camera.nodes, segments) };
+}
+
+function getCameraViewQuaternion(camera: DirectorCameraShot): [number, number, number, number] {
+  const snapshot = getCameraViewSnapshotFromShot(camera);
+  const quaternion = getLookAtQuaternion(snapshot.position, snapshot.target);
+
+  return [quaternion.x, quaternion.y, quaternion.z, quaternion.w];
 }
 
 function roundTransformValue(value: number) {
@@ -357,6 +501,9 @@ function migrateDirectorProject(project: DirectorProject): DirectorProject {
         },
       };
     }),
+    cameras: project.cameras.map((camera) =>
+      camera.nodes && camera.nodes.length >= 2 ? rebuildCameraTiming(camera) : camera
+    ),
   };
 }
 
@@ -1987,6 +2134,292 @@ export const useDirectorStore = create<DirectorStore>((set, get) => {
           ),
         },
       })),
+    recordCameraNode: (cameraId, input) =>
+      commitMutation((state) => {
+        const camera = state.project.cameras.find((item) => item.id === cameraId);
+        if (!camera) return state;
+
+        const existingNodes = camera.nodes ?? [];
+        const nodeId = getNextSequentialId(
+          existingNodes.map((item) => item.id),
+          "node_",
+          existingNodes.length + 1
+        );
+        const lastNode = existingNodes[existingNodes.length - 1];
+        const lastSegment = camera.segments?.[camera.segments.length - 1];
+        const nextTime = lastNode
+          ? lastNode.time + (lastSegment?.duration ?? 1) + (lastSegment?.holdAfter ?? 0)
+          : 0;
+        const nextNodes: CameraNode[] = [
+          ...existingNodes,
+          {
+            id: nodeId,
+            position: input.position,
+            rotation: input.rotation,
+            fov: input.fov,
+            time: Number(nextTime.toFixed(6)),
+          },
+        ];
+        const nextCamera = rebuildCameraTiming({ ...camera, nodes: nextNodes });
+
+        return applyCameraPose(
+          {
+            ...state,
+            project: { ...state.project, cameras: state.project.cameras.map((item) => (item.id === cameraId ? nextCamera : item)) },
+          },
+          cameraId,
+          input,
+          nextCamera.nodes
+        );
+      }),
+    syncCameraPose: (cameraId, input) =>
+      commitMutation((state) => {
+        const camera = state.project.cameras.find((item) => item.id === cameraId);
+        if (!camera) return state;
+        return applyCameraPose(state, cameraId, input, camera.nodes);
+      }),
+    applyPlaybackPose: (cameraId, input) =>
+      commitMutation(
+        (state) => {
+          const camera = state.project.cameras.find((item) => item.id === cameraId);
+          if (!camera) return state;
+          return applyCameraPose(state, cameraId, input, camera.nodes);
+        },
+        { trackUndo: false, persist: false }
+      ),
+    updateCameraNode: (cameraId, nodeId, patch) =>
+      commitMutation((state) => {
+        const camera = state.project.cameras.find((item) => item.id === cameraId);
+        if (!camera?.nodes) return state;
+
+        const nodes = camera.nodes.map((node) =>
+          node.id === nodeId ? { ...node, ...patch, id: node.id, time: node.time } : node
+        );
+
+        return {
+          ...state,
+          project: {
+            ...state.project,
+            cameras: state.project.cameras.map((item) => (item.id === cameraId ? rebuildCameraTiming({ ...camera, nodes }) : item)),
+          },
+        };
+      }),
+    updateCameraNodeTime: (cameraId, nodeId, time) =>
+      commitMutation((state) => {
+        const camera = state.project.cameras.find((item) => item.id === cameraId);
+        if (!camera?.nodes) return state;
+
+        const index = camera.nodes.findIndex((node) => node.id === nodeId);
+        if (index < 0) return state;
+
+        const segments = buildCameraSegments(camera.nodes, camera.segments);
+        const clampedTime = clampNodeTime(camera.nodes, segments, index, time);
+        if (clampedTime === camera.nodes[index].time) return state;
+
+        const nodes = camera.nodes.map((node, nodeIndex) => (nodeIndex === index ? { ...node, time: clampedTime } : node));
+        const nextSegments = segments.map((segment, segmentIndex) => {
+          if (segmentIndex !== index - 1) return segment;
+          // 拖拽节点 = 改变前一段的运动时长，holdAfter 不动
+          const previousNode = nodes[index - 1];
+          return {
+            ...segment,
+            duration: Number(Math.max(clampedTime - previousNode.time - segment.holdAfter, MIN_SEGMENT_DURATION).toFixed(6)),
+          };
+        });
+        const syncedNodes = syncNodeTimes(nodes, nextSegments);
+
+        return {
+          ...state,
+          project: {
+            ...state.project,
+            cameras: state.project.cameras.map((item) =>
+              item.id === cameraId ? { ...camera, nodes: syncedNodes, segments: nextSegments } : item
+            ),
+          },
+        };
+      }),
+    addCameraNode: (cameraId, afterNodeId) =>
+      commitMutation((state) => {
+        const camera = state.project.cameras.find((item) => item.id === cameraId);
+        if (!camera) return state;
+
+        const nodes = camera.nodes ?? [];
+        const insertIndex = afterNodeId
+          ? nodes.findIndex((node) => node.id === afterNodeId) + 1
+          : nodes.length;
+        if (insertIndex < 0 || insertIndex > nodes.length) return state;
+
+        const nodeId = getNextSequentialId(
+          nodes.map((item) => item.id),
+          "node_",
+          nodes.length + 1
+        );
+        const previousNode = nodes[insertIndex - 1] ?? null;
+        const nextNode = nodes[insertIndex] ?? null;
+        const segments = buildCameraSegments(nodes, camera.segments);
+
+        let nextCameraNode: CameraNode;
+        if (previousNode && nextNode) {
+          // 插在中间：取两端中点姿态，时间居中，旧段缓动/停顿继承到两段
+          const oldSegment = segments[insertIndex - 1];
+          const midpoint: [number, number, number] = [
+            (previousNode.position[0] + nextNode.position[0]) / 2,
+            (previousNode.position[1] + nextNode.position[1]) / 2,
+            (previousNode.position[2] + nextNode.position[2]) / 2,
+          ];
+          const previousRotation = new Quaternion(...previousNode.rotation).normalize();
+          const nextRotation = new Quaternion(...nextNode.rotation).normalize();
+          const midpointRotation = previousRotation.clone().slerp(nextRotation, 0.5);
+          const midpointTime = clampNodeTime(nodes, segments, insertIndex, (previousNode.time + nextNode.time) / 2);
+
+          nextCameraNode = {
+            id: nodeId,
+            position: midpoint,
+            rotation: [midpointRotation.x, midpointRotation.y, midpointRotation.z, midpointRotation.w],
+            fov: (previousNode.fov + nextNode.fov) / 2,
+            time: midpointTime,
+          };
+          const nextNodes = [...nodes.slice(0, insertIndex), nextCameraNode, ...nodes.slice(insertIndex)];
+          const mergedSegments = buildCameraSegments(nextNodes, segments).map((segment, segmentIndex) => {
+            if (segmentIndex === insertIndex - 1) {
+              return { ...segment, easing: oldSegment?.easing ?? "linear", holdAfter: 0 };
+            }
+            if (segmentIndex === insertIndex) {
+              // 旧段 hold 归属终点节点：继承到新节点→旧终点段，duration 扣除 hold 部分
+              const inheritedHold = oldSegment?.holdAfter ?? 0;
+              return {
+                ...segment,
+                easing: oldSegment?.easing ?? "linear",
+                holdAfter: inheritedHold,
+                duration: Number(Math.max(segment.duration - inheritedHold, MIN_SEGMENT_DURATION).toFixed(6)),
+              };
+            }
+            return segment;
+          });
+
+          return {
+            ...state,
+            project: {
+              ...state.project,
+              cameras: state.project.cameras.map((item) =>
+                item.id === cameraId
+                  ? { ...camera, nodes: syncNodeTimes(nextNodes, mergedSegments), segments: mergedSegments }
+                  : item
+              ),
+            },
+          };
+        }
+
+        // 追加（或无节点时创建第一个）：取当前机位取景姿态
+        const snapshot = getCameraViewSnapshotFromShot(camera);
+        const rotation = getLookAtQuaternion(snapshot.position, snapshot.target);
+        nextCameraNode = {
+          id: nodeId,
+          position: snapshot.position,
+          rotation: [rotation.x, rotation.y, rotation.z, rotation.w],
+          fov: camera.fov,
+          time: previousNode
+            ? previousNode.time + (segments[segments.length - 1]?.duration ?? 1) + (segments[segments.length - 1]?.holdAfter ?? 0)
+            : 0,
+        };
+        const nextNodes = [...nodes, nextCameraNode];
+
+        return {
+          ...state,
+          project: {
+            ...state.project,
+            cameras: state.project.cameras.map((item) =>
+              item.id === cameraId ? rebuildCameraTiming({ ...camera, nodes: nextNodes }) : item
+            ),
+          },
+        };
+      }),
+    deleteCameraNode: (cameraId, nodeId) =>
+      commitMutation((state) => {
+        const camera = state.project.cameras.find((item) => item.id === cameraId);
+        if (!camera?.nodes) return state;
+
+        const nextNodes = camera.nodes.filter((node) => node.id !== nodeId);
+        if (nextNodes.length === camera.nodes.length) return state;
+
+        return {
+          ...state,
+          project: {
+            ...state.project,
+            cameras: state.project.cameras.map((item) =>
+              item.id === cameraId ? rebuildCameraTiming({ ...camera, nodes: nextNodes }) : item
+            ),
+          },
+        };
+      }),
+    updateCameraSegment: (cameraId, segmentId, patch) =>
+      commitMutation((state) => {
+        const camera = state.project.cameras.find((item) => item.id === cameraId);
+        if (!camera?.nodes) return state;
+
+        const segments = buildCameraSegments(camera.nodes, camera.segments);
+        const nextSegments = segments.map((segment) =>
+          segment.id === segmentId
+            ? {
+                ...segment,
+                ...patch,
+                duration: patch.duration
+                  ? Number(Math.max(patch.duration, MIN_SEGMENT_DURATION).toFixed(6))
+                  : segment.duration,
+                holdAfter: patch.holdAfter ? Number(Math.max(patch.holdAfter, 0).toFixed(6)) : segment.holdAfter,
+              }
+            : segment
+        );
+
+        const cameraNodes = camera.nodes;
+        return {
+          ...state,
+          project: {
+            ...state.project,
+            cameras: state.project.cameras.map((item) =>
+              item.id === cameraId
+                ? { ...camera, segments: nextSegments, nodes: syncNodeTimes(cameraNodes, nextSegments) }
+                : item
+            ),
+          },
+        };
+      }),
+    setSegmentCurveMode: (cameraId, segmentId, mode) =>
+      commitMutation((state) => {
+        const camera = state.project.cameras.find((item) => item.id === cameraId);
+        if (!camera?.nodes) return state;
+
+        const segments = buildCameraSegments(camera.nodes, camera.segments);
+        const nextSegments = segments.map((segment) => {
+          if (segment.id !== segmentId) return segment;
+
+          if (mode === "bezier") {
+            const fromNode = camera.nodes?.find((node) => node.id === segment.fromNodeId);
+            const toNode = camera.nodes?.find((node) => node.id === segment.toNodeId);
+            if (!fromNode || !toNode) return segment;
+
+            const handles = getDefaultBezierHandles(fromNode.position, toNode.position);
+            return {
+              ...segment,
+              curveMode: mode,
+              handleOut: segment.handleOut ?? handles.handleOut,
+              handleIn: segment.handleIn ?? handles.handleIn,
+            };
+          }
+
+          return { ...segment, curveMode: mode };
+        });
+
+        return {
+          ...state,
+          project: {
+            ...state.project,
+            cameras: state.project.cameras.map((item) =>
+              item.id === cameraId ? { ...camera, segments: nextSegments } : item
+            ),
+          },
+        };
+      }),
     copySelectedObjects: () => {
       const currentState = get() as DirectorRuntimeState;
       const clipboard = buildClipboardEntries(currentState);
