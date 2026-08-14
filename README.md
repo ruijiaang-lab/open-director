@@ -2,6 +2,10 @@
 
 > 浏览器里的 3D 分镜导演台 — 搭场景、摆机位、录运镜、导出视频，全程不装软件。
 
+## 🚀 在线试玩
+
+**不用下载，点开就能用：** [open-director.pages.dev](https://open-director.pages.dev)
+
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![React](https://img.shields.io/badge/React-18-blue)](https://react.dev)
 [![Vite](https://img.shields.io/badge/Vite-6-purple)](https://vitejs.dev)
