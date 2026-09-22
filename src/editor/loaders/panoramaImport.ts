@@ -3,6 +3,12 @@ const PANORAMA_RATIO = 2;
 const PANORAMA_RATIO_TOLERANCE = 0.02;
 const PANORAMA_MIN_WIDTH = 2048;
 const PANORAMA_MAX_WIDTH = 4096;
+export const PANORAMA_PERSISTENCE_BUDGET_CHARS = 1_500_000;
+const PANORAMA_PERSISTENCE_MIN_WIDTH = 512;
+const PANORAMA_PERSISTENCE_WIDTH_SCALE = 0.75;
+const PANORAMA_PERSISTENCE_QUALITIES = [0.92, 0.82, 0.72, 0.62, 0.52] as const;
+const PANORAMA_REENCODE_MIME_TYPE = "image/jpeg" as const;
+const SUPPORTED_PANORAMA_MIME_TYPES = ["image/jpeg", "image/png", "image/webp"] as const;
 const PANORAMA_SEAM_BLEND_RATIO = 0.035;
 const PANORAMA_SEAM_MIN_WIDTH = 32;
 const PANORAMA_SEAM_MAX_WIDTH = 192;
@@ -16,6 +22,8 @@ type PanoramaImageSource = {
   close?: () => void;
 };
 
+type SupportedPanoramaMimeType = (typeof SUPPORTED_PANORAMA_MIME_TYPES)[number];
+
 type ContainPlacement = {
   x: number;
   y: number;
@@ -27,6 +35,28 @@ function isPanoramaRatio(width: number, height: number) {
   return Math.abs(width / height - PANORAMA_RATIO) <= PANORAMA_RATIO_TOLERANCE;
 }
 
+export function isPanoramaDataUrlWithinPersistenceBudget(dataUrl: string) {
+  return dataUrl.length <= PANORAMA_PERSISTENCE_BUDGET_CHARS;
+}
+
+export function getPanoramaPersistenceWidthCandidates(sourceWidth: number) {
+  const safeSourceWidth = Number.isFinite(sourceWidth) && sourceWidth > 0 ? sourceWidth : PANORAMA_PERSISTENCE_MIN_WIDTH;
+  let width = roundToEven(
+    clamp(safeSourceWidth, PANORAMA_PERSISTENCE_MIN_WIDTH, PANORAMA_MAX_WIDTH)
+  );
+  const candidates = [width];
+
+  while (width > PANORAMA_PERSISTENCE_MIN_WIDTH) {
+    const nextWidth = roundToEven(Math.max(PANORAMA_PERSISTENCE_MIN_WIDTH, width * PANORAMA_PERSISTENCE_WIDTH_SCALE));
+    if (nextWidth >= width) break;
+
+    candidates.push(nextWidth);
+    width = nextWidth;
+  }
+
+  return candidates;
+}
+
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
@@ -34,6 +64,57 @@ function clamp(value: number, min: number, max: number) {
 function roundToEven(value: number) {
   const rounded = Math.round(value);
   return rounded % 2 === 0 ? rounded : rounded + 1;
+}
+
+function isSupportedPanoramaMimeType(value: string): value is SupportedPanoramaMimeType {
+  return (SUPPORTED_PANORAMA_MIME_TYPES as readonly string[]).includes(value);
+}
+
+function getPanoramaFileExtension(fileName: string) {
+  return fileName.match(/\.([^.]+)$/i)?.[1]?.toLowerCase() ?? "";
+}
+
+function getPanoramaMimeTypeForExtension(extension: string): SupportedPanoramaMimeType | null {
+  if (extension === "jpg" || extension === "jpeg") return "image/jpeg";
+  if (extension === "png") return "image/png";
+  if (extension === "webp") return "image/webp";
+  return null;
+}
+
+function normalizePanoramaFileMimeType(file: File): SupportedPanoramaMimeType {
+  const extensionMimeType = getPanoramaMimeTypeForExtension(getPanoramaFileExtension(file.name));
+  if (!extensionMimeType) {
+    throw new Error("当前全景图仅支持 JPG / PNG / WEBP");
+  }
+
+  const declaredMimeType = file.type.trim().toLowerCase();
+  if (!declaredMimeType) return extensionMimeType;
+  if (!isSupportedPanoramaMimeType(declaredMimeType)) {
+    throw new Error("全景图 MIME 类型仅支持 image/jpeg、image/png、image/webp");
+  }
+  if (declaredMimeType !== extensionMimeType) {
+    throw new Error("全景图 MIME 类型与扩展名不匹配");
+  }
+
+  return declaredMimeType;
+}
+
+function normalizePanoramaDataUrl(dataUrl: string, expectedMimeType?: SupportedPanoramaMimeType) {
+  const match = /^data:([^;,]*);base64,([A-Za-z0-9+/_-]+={0,2})$/i.exec(dataUrl.trim());
+  if (!match) {
+    throw new Error("全景图必须是受支持的 image data URL");
+  }
+
+  const declaredMimeType = match[1]?.toLowerCase() ?? "";
+  const mimeType = declaredMimeType || expectedMimeType;
+  if (!mimeType || !isSupportedPanoramaMimeType(mimeType)) {
+    throw new Error("全景图必须是受支持的 image data URL");
+  }
+  if (expectedMimeType && declaredMimeType && declaredMimeType !== expectedMimeType) {
+    throw new Error("全景图 data URL MIME 类型与文件扩展名不匹配");
+  }
+
+  return `data:${mimeType};base64,${match[2] ?? ""}`;
 }
 
 function getContainPlacement(
@@ -272,31 +353,189 @@ async function readImageSource(file: File): Promise<PanoramaImageSource & Canvas
   }
 
   return await new Promise<HTMLImageElement>((resolve, reject) => {
-    const probeUrl = URL.createObjectURL(file);
-    const image = new Image();
+    let probeUrl: string;
+    try {
+      probeUrl = URL.createObjectURL(file);
+    } catch {
+      reject(new Error("无法读取全景图尺寸，请重新选择图片"));
+      return;
+    }
 
-    image.onload = () => {
-      URL.revokeObjectURL(probeUrl);
-      resolve(image);
+    let image: HTMLImageElement | null = null;
+    let settled = false;
+    let revoked = false;
+
+    const revokeProbeUrl = () => {
+      if (revoked) return;
+      revoked = true;
+      try {
+        URL.revokeObjectURL(probeUrl);
+      } catch {
+        // Releasing a temporary probe URL must not mask the original read result.
+      }
     };
 
-    image.onerror = () => {
-      URL.revokeObjectURL(probeUrl);
+    const cleanup = () => {
+      try {
+        if (image) {
+          image.onload = null;
+          image.onerror = null;
+        }
+      } finally {
+        revokeProbeUrl();
+      }
+    };
+
+    const fail = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
       reject(new Error("无法读取全景图尺寸，请重新选择图片"));
     };
 
-    image.src = probeUrl;
+    const succeed = () => {
+      if (settled || !image) return;
+      settled = true;
+      const resolvedImage = image;
+      cleanup();
+      resolve(resolvedImage);
+    };
+
+    try {
+      image = new Image();
+      image.onload = succeed;
+      image.onerror = fail;
+      image.src = probeUrl;
+    } catch {
+      fail();
+    }
   });
 }
 
-async function buildAdaptedPanoramaAsset(file: File) {
+function readFileAsDataUrl(file: File, expectedMimeType: SupportedPanoramaMimeType): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let reader: FileReader | null = null;
+    let settled = false;
+
+    const cleanup = () => {
+      if (!reader) return;
+      reader.onload = null;
+      reader.onerror = null;
+      reader.onabort = null;
+    };
+
+    const resolveOnce = (dataUrl: string) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(dataUrl);
+    };
+
+    const rejectOnce = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+
+    const fail = () => rejectOnce(new Error("无法将全景图持久化为 data URL"));
+
+    try {
+      reader = new FileReader();
+      reader.onload = () => {
+        if (!reader || typeof reader.result !== "string") {
+          fail();
+          return;
+        }
+
+        try {
+          resolveOnce(normalizePanoramaDataUrl(reader.result, expectedMimeType));
+        } catch (error) {
+          rejectOnce(error instanceof Error ? error : new Error("全景图必须是受支持的 image data URL"));
+        }
+      };
+      reader.onerror = fail;
+      reader.onabort = fail;
+      reader.readAsDataURL(file);
+    } catch {
+      fail();
+    }
+  });
+}
+
+function createSafePanoramaDataUrl(source: PanoramaImageSource & CanvasImageSource) {
+  let canvas: HTMLCanvasElement;
+  let context: CanvasRenderingContext2D | null;
+
+  try {
+    canvas = document.createElement("canvas");
+    context = canvas.getContext("2d");
+  } catch {
+    throw new Error("当前环境无法生成安全全景图");
+  }
+
+  if (!context) {
+    throw new Error("当前环境无法生成安全全景图");
+  }
+
+  let invalidDataUrl = false;
+
+  for (const width of getPanoramaPersistenceWidthCandidates(source.width)) {
+    const height = width / PANORAMA_RATIO;
+    canvas.width = width;
+    canvas.height = height;
+    context.fillStyle = "#06080D";
+    context.fillRect(0, 0, width, height);
+
+    try {
+      drawImageContain(context, source, getContainPlacement(source.width, source.height, width, height));
+    } catch {
+      continue;
+    }
+
+    for (const quality of PANORAMA_PERSISTENCE_QUALITIES) {
+      let dataUrl: string;
+      try {
+        dataUrl = canvas.toDataURL(PANORAMA_REENCODE_MIME_TYPE, quality);
+      } catch {
+        continue;
+      }
+
+      try {
+        const normalizedDataUrl = normalizePanoramaDataUrl(dataUrl);
+        if (isPanoramaDataUrlWithinPersistenceBudget(normalizedDataUrl)) {
+          return normalizedDataUrl;
+        }
+      } catch {
+        invalidDataUrl = true;
+      }
+    }
+  }
+
+  if (invalidDataUrl) {
+    throw new Error("全景图重编码结果不是受支持的 image data URL");
+  }
+  throw new Error("无法将全景图压缩到安全持久化大小");
+}
+
+async function buildAdaptedPanoramaAsset(file: File, inputMimeType: SupportedPanoramaMimeType) {
   const source = await readImageSource(file);
 
   try {
     if (isPanoramaRatio(source.width, source.height)) {
+      if (file.size <= PANORAMA_PERSISTENCE_BUDGET_CHARS) {
+        const dataUrl = await readFileAsDataUrl(file, inputMimeType);
+        if (isPanoramaDataUrlWithinPersistenceBudget(dataUrl)) {
+          return {
+            projectionMode: "equirectangular" as const,
+            url: dataUrl,
+          };
+        }
+      }
+
       return {
         projectionMode: "equirectangular" as const,
-        url: URL.createObjectURL(file),
+        url: createSafePanoramaDataUrl(source),
       };
     }
 
@@ -318,9 +557,30 @@ async function buildAdaptedPanoramaAsset(file: File) {
 
     optimizeAdaptedPanoramaProjection(context, width, height);
 
+    let initialDataUrl: string | null = null;
+    try {
+      initialDataUrl = canvas.toDataURL("image/jpeg", 0.92);
+    } catch {
+      // Let the bounded fallback encoder produce the final explicit error or result.
+    }
+
+    if (initialDataUrl) {
+      try {
+        const normalizedDataUrl = normalizePanoramaDataUrl(initialDataUrl);
+        if (isPanoramaDataUrlWithinPersistenceBudget(normalizedDataUrl)) {
+          return {
+            projectionMode: "backdrop" as const,
+            url: normalizedDataUrl,
+          };
+        }
+      } catch {
+        // Let the bounded fallback encoder produce the final explicit error or result.
+      }
+    }
+
     return {
       projectionMode: "backdrop" as const,
-      url: canvas.toDataURL("image/jpeg", 0.92),
+      url: createSafePanoramaDataUrl(canvas),
     };
   } finally {
     source.close?.();
@@ -331,7 +591,8 @@ export async function readPanoramaFile(file: File) {
   if (!PANORAMA_IMAGE_EXTENSION_RE.test(file.name)) {
     throw new Error("当前全景图仅支持 JPG / PNG / WEBP");
   }
-  const result = await buildAdaptedPanoramaAsset(file);
+  const inputMimeType = normalizePanoramaFileMimeType(file);
+  const result = await buildAdaptedPanoramaAsset(file, inputMimeType);
 
   return {
     id: crypto.randomUUID(),
