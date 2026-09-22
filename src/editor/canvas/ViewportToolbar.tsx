@@ -42,7 +42,11 @@ import {
   type ViewportAspectRatio,
 } from "../schema/viewportAspectRatio";
 import { BODY_TYPE_OPTIONS, type CharacterBodyType } from "../runtime/mannequin/bodyTypes";
-import { GEOMETRY_PRIMITIVE_OPTIONS, type GeometryPrimitiveType } from "../schema/directorProject";
+import {
+  GEOMETRY_PRIMITIVE_OPTIONS,
+  type DirectorCameraShot,
+  type GeometryPrimitiveType,
+} from "../schema/directorProject";
 import {
   useDirectorStore,
   type CameraShotSnapshot,
@@ -54,7 +58,13 @@ type ToolbarAction = {
   label: string;
   icon: LucideIcon;
   mode?: TransformMode;
+  disabled?: boolean;
   onClick: () => void;
+};
+
+type OperationError = {
+  id: number;
+  message: string;
 };
 
 const DEFAULT_VIEWPORT_TOOLBAR_HEIGHT = 46;
@@ -81,6 +91,12 @@ function waitForNextAnimationFrame() {
   return new Promise<void>((resolve) => {
     requestAnimationFrame(() => resolve());
   });
+}
+
+function getOperationErrorMessage(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message.trim()) return error.message;
+  if (typeof error === "string" && error.trim()) return error;
+  return fallback;
 }
 
 export function ViewportToolbar({
@@ -119,6 +135,10 @@ export function ViewportToolbar({
   const [crowdSpacing, setCrowdSpacing] = useState(String(DEFAULT_CROWD_SPACING));
   const [activeModelLibraryCategoryId, setActiveModelLibraryCategoryId] =
     useState<ModelLibraryCategoryId>("convenience");
+  const [operationError, setOperationError] = useState<OperationError | null>(null);
+  const [captureBusy, setCaptureBusy] = useState(false);
+  const captureBusyRef = useRef(false);
+  const operationEpochRef = useRef(0);
   const addImportedAsset = useDirectorStore((state) => state.addImportedAsset);
   const addObjectFromAsset = useDirectorStore((state) => state.addObjectFromAsset);
   const removeImportedAsset = useDirectorStore((state) => state.removeImportedAsset);
@@ -131,6 +151,9 @@ export function ViewportToolbar({
   const activeCameraId = useDirectorStore((state) => state.project.activeCameraId);
   const cameras = useDirectorStore((state) => state.project.cameras);
   const setActiveCamera = useDirectorStore((state) => state.setActiveCamera);
+  const markTemporaryCameraCapture = useDirectorStore((state) => state.markTemporaryCameraCapture);
+  const commitTemporaryCameraCapture = useDirectorStore((state) => state.commitTemporaryCameraCapture);
+  const rollbackTemporaryCameraCapture = useDirectorStore((state) => state.rollbackTemporaryCameraCapture);
   const viewMode = useDirectorStore((state) => state.viewMode);
   const transformMode = useDirectorStore((state) => state.transformMode);
   const viewportAspectRatio = useDirectorStore((state) => state.viewportAspectRatio);
@@ -268,6 +291,32 @@ export function ViewportToolbar({
     };
   }, [characterMenuOpen, crowdPanelOpen, geometryMenuOpen, modelLibraryOpen]);
 
+  function beginOperation() {
+    const operationId = operationEpochRef.current + 1;
+    operationEpochRef.current = operationId;
+    setOperationError(null);
+    return operationId;
+  }
+
+  function isLatestOperation(operationId: number) {
+    return operationEpochRef.current === operationId;
+  }
+
+  function clearLatestOperationError(operationId: number) {
+    if (isLatestOperation(operationId)) setOperationError(null);
+  }
+
+  function setLatestOperationError(operationId: number, error: unknown, fallback: string) {
+    if (isLatestOperation(operationId)) {
+      setOperationError({ id: operationId, message: getOperationErrorMessage(error, fallback) });
+    }
+  }
+
+  function clearOperationError() {
+    operationEpochRef.current += 1;
+    setOperationError(null);
+  }
+
   async function handleLocalModelChange(
     event: ChangeEvent<HTMLInputElement>,
     addToScene: boolean
@@ -275,6 +324,7 @@ export function ViewportToolbar({
     const input = event.currentTarget;
     const files = Array.from(input.files ?? []);
     if (!files.length) return;
+    const operationId = beginOperation();
 
     try {
       for (const file of files) {
@@ -286,8 +336,9 @@ export function ViewportToolbar({
           assetSource: "local",
         });
       }
-    } catch {
-      // The toolbar keeps file actions quiet; detailed import feedback lives in the side panel.
+      clearLatestOperationError(operationId);
+    } catch (error) {
+      setLatestOperationError(operationId, error, "本地模型导入失败");
     } finally {
       input.value = "";
     }
@@ -297,37 +348,97 @@ export function ViewportToolbar({
     const input = event.currentTarget;
     const file = input.files?.[0];
     if (!file) return;
+    const operationId = beginOperation();
 
     try {
       const result = await readPanoramaFile(file);
       addImportedAsset({ kind: "panorama", ...result });
-    } catch {
-      // The toolbar keeps file actions quiet; detailed import feedback lives in the side panel.
+      clearLatestOperationError(operationId);
+    } catch (error) {
+      setLatestOperationError(operationId, error, "全景图导入失败");
     } finally {
       input.value = "";
     }
   }
 
   async function handleCapture(preset: "current" | "four" | "twelve") {
+    if (captureBusyRef.current) return;
+    captureBusyRef.current = true;
+    setCaptureBusy(true);
+    const operationId = beginOperation();
+    const previousViewMode = viewMode;
+    const beforeCaptureState = useDirectorStore.getState();
+    const previousActiveCameraId = beforeCaptureState.project.activeCameraId;
+    const previousSelectedObjectId = beforeCaptureState.selectedObjectId;
+    const previousSelectedObjectIds = [...beforeCaptureState.selectedObjectIds];
+    const previousSelectedCrowdId = beforeCaptureState.selectedCrowdId;
+    const previousDirectorInspectorMode = beforeCaptureState.directorInspectorMode;
+    let createdCameraId: string | null = null;
+    let capturedCameraReference: DirectorCameraShot | null = null;
+    const transientCaptureToken = `viewport-capture-${Date.now()}-${operationId}`;
+
     try {
-      const targetCameraId =
-        viewMode === "director" ? addCameraShot(getViewportCameraSnapshot?.()) : activeCameraId;
+      let targetCameraId = activeCameraId;
+      if (viewMode === "director") {
+        createdCameraId = addCameraShot(getViewportCameraSnapshot?.());
+        markTemporaryCameraCapture(createdCameraId, transientCaptureToken);
+        targetCameraId = createdCameraId;
+      }
 
       setViewMode("camera");
       await waitForNextAnimationFrame();
+
+      if (!createdCameraId) {
+        capturedCameraReference = targetCameraId
+          ? useDirectorStore.getState().project.cameras.find((camera) => camera.id === targetCameraId) ?? null
+          : null;
+      }
 
       const results = await requestViewportCapture({
         preset,
         source: "camera-panel",
         cameraId: targetCameraId,
       });
-      addCameraCaptures(targetCameraId, results.map((result) => result.dataUrl));
-    } catch {
-      // Keep the capsule toolbar icon-only and free of transient status text.
+      const dataUrls = results.map((result) => result.dataUrl);
+      if (createdCameraId) {
+        if (!commitTemporaryCameraCapture(createdCameraId, transientCaptureToken, dataUrls)) {
+          throw new Error("截图目标已变化");
+        }
+      } else {
+        const currentTargetCamera = targetCameraId
+          ? useDirectorStore.getState().project.cameras.find((camera) => camera.id === targetCameraId) ?? null
+          : null;
+        if (capturedCameraReference === null || currentTargetCamera !== capturedCameraReference) {
+          throw new Error("截图目标已变化，本次结果已丢弃");
+        }
+        addCameraCaptures(targetCameraId, dataUrls);
+      }
+      clearLatestOperationError(operationId);
+    } catch (error) {
+      if (createdCameraId) {
+        rollbackTemporaryCameraCapture({
+          cameraId: createdCameraId,
+          token: transientCaptureToken,
+          previousActiveCameraId,
+          previousSelectedObjectId,
+          previousSelectedObjectIds,
+          previousSelectedCrowdId,
+          previousViewMode,
+          previousDirectorInspectorMode,
+        });
+      } else if (previousViewMode !== "camera") {
+        setViewMode(previousViewMode);
+      }
+
+      setLatestOperationError(operationId, error, "截图失败");
+    } finally {
+      captureBusyRef.current = false;
+      setCaptureBusy(false);
     }
   }
 
   function selectTransformMode(mode: TransformMode) {
+    clearOperationError();
     setTransformMode(mode);
   }
 
@@ -340,6 +451,7 @@ export function ViewportToolbar({
   }
 
   function addCharacterWithBodyType(bodyType: CharacterBodyType) {
+    clearOperationError();
     addPresetCharacter(bodyType);
     setCharacterMenuOpen(false);
     setGeometryMenuOpen(false);
@@ -347,6 +459,7 @@ export function ViewportToolbar({
   }
 
   function addGeometryWithType(geometryType: GeometryPrimitiveType) {
+    clearOperationError();
     addGeometryPrimitive(geometryType);
     setCharacterMenuOpen(false);
     setGeometryMenuOpen(false);
@@ -380,6 +493,7 @@ export function ViewportToolbar({
   function addCrowd() {
     const nextInput = getCrowdInputValue();
     applyCrowdValueDrafts(nextInput);
+    clearOperationError();
     addCrowdCharacters(nextInput);
     setCharacterMenuOpen(false);
     setGeometryMenuOpen(false);
@@ -395,6 +509,7 @@ export function ViewportToolbar({
   }
 
   function addModelLibraryItem(item: ModelLibraryItem) {
+    clearOperationError();
     addImportedAsset({
       kind: "prop",
       assetSource: "library",
@@ -425,6 +540,7 @@ export function ViewportToolbar({
 
   function addCameraFromViewport() {
     const snapshot = getViewportCameraSnapshot?.();
+    clearOperationError();
     addCameraShot(snapshot);
   }
 
@@ -437,8 +553,25 @@ export function ViewportToolbar({
   }
 
   function selectAspectRatio(ratio: ViewportAspectRatio) {
+    clearOperationError();
     setViewportAspectRatio(ratio);
     setAspectRatioPanelOpen(false);
+  }
+
+  function toggleViewMode() {
+    clearOperationError();
+    setViewMode(viewMode === "camera" ? "director" : "camera");
+  }
+
+  function selectCamera(cameraId: string) {
+    clearOperationError();
+    setActiveCamera(cameraId);
+    setViewMode("camera");
+  }
+
+  function toggleFullscreen() {
+    clearOperationError();
+    toggleViewportPanelsCollapsed();
   }
 
   const actions: ToolbarAction[] = [
@@ -456,10 +589,10 @@ export function ViewportToolbar({
     { label: "模型库", icon: Boxes, onClick: toggleModelLibrary },
     { label: "添加机位", icon: Video, onClick: addCameraFromViewport },
     { label: "选择画幅比例", icon: Ratio, onClick: toggleAspectRatioPanel },
-    { label: "当前视角截图", icon: Camera, onClick: () => void handleCapture("current") },
-    { label: "四方位截图", icon: Grid2X2, onClick: () => void handleCapture("four") },
-    { label: "十二方位截图", icon: Grid3X3, onClick: () => void handleCapture("twelve") },
-    { label: "全屏", icon: Expand, onClick: toggleViewportPanelsCollapsed },
+    { label: "当前视角截图", icon: Camera, disabled: captureBusy, onClick: () => void handleCapture("current") },
+    { label: "四方位截图", icon: Grid2X2, disabled: captureBusy, onClick: () => void handleCapture("four") },
+    { label: "十二方位截图", icon: Grid3X3, disabled: captureBusy, onClick: () => void handleCapture("twelve") },
+    { label: "全屏", icon: Expand, onClick: toggleFullscreen },
   ];
 
   function renderActionButton(action: ToolbarAction) {
@@ -472,6 +605,7 @@ export function ViewportToolbar({
         aria-label={action.label}
         aria-pressed={action.mode ? active : undefined}
         className={`ui-icon-button viewport-toolbar-button${active ? " is-active" : ""}`}
+        disabled={action.disabled}
         type="button"
         onClick={action.onClick}
       >
@@ -502,12 +636,17 @@ export function ViewportToolbar({
 
   return (
     <>
+      {operationError ? (
+        <div key={operationError.id} className="viewport-operation-error" role="alert" aria-live="assertive">
+          {operationError.message}
+        </div>
+      ) : null}
       <div className="viewport-toolbar" role="group" aria-label="3D视口快捷工具" ref={setToolbarElement}>
         <button
           aria-label={viewMode === "camera" ? "切换到导演视角" : "切换到机位视角"}
           className={`ui-icon-button viewport-toolbar-button${viewMode === "camera" ? " is-active" : ""}`}
           type="button"
-          onClick={() => setViewMode(viewMode === "camera" ? "director" : "camera")}
+          onClick={toggleViewMode}
         >
           <Camera aria-hidden="true" size={17} strokeWidth={1.9} />
           <span className="viewport-toolbar-label">{viewMode === "camera" ? "导演视角" : "机位视角"}</span>
@@ -526,10 +665,7 @@ export function ViewportToolbar({
               padding: "0 6px",
             }}
             value={activeCameraId ?? ""}
-            onChange={(event) => {
-              setActiveCamera(event.target.value);
-              setViewMode("camera");
-            }}
+            onChange={(event) => selectCamera(event.target.value)}
           >
             {cameras.map((camera) => (
               <option key={camera.id} value={camera.id}>

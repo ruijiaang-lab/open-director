@@ -2,15 +2,21 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, vi } from "vitest";
 import { clearViewportCaptureHandler, setViewportCaptureHandler } from "../io/captureBridge";
+import type { ScreenshotResult } from "../io/screenshotExport";
 import { BODY_TYPE_OPTIONS } from "../runtime/mannequin/bodyTypes";
 import { createInitialDirectorState, useDirectorStore } from "../store/directorStore";
 import { getCameraRigPositionFromViewSnapshot, getCameraViewSnapshotFromShot } from "../schema/cameraGeometry";
 import { ViewportToolbar } from "./ViewportToolbar";
 
 const mockReadLocalModelFile = vi.fn();
+const mockReadPanoramaFile = vi.fn();
 
 vi.mock("../loaders/localModelImport", () => ({
   readLocalModelFile: (...args: unknown[]) => mockReadLocalModelFile(...args),
+}));
+
+vi.mock("../loaders/panoramaImport", () => ({
+  readPanoramaFile: (...args: unknown[]) => mockReadPanoramaFile(...args),
 }));
 
 // 模型库资产目录（模型库/）不在仓库内，catalog 的 import.meta.glob 在测试环境解析为空。
@@ -110,6 +116,7 @@ beforeEach(() => {
     ...createInitialDirectorState(),
   });
   mockReadLocalModelFile.mockReset();
+  mockReadPanoramaFile.mockReset();
 });
 
 afterEach(() => {
@@ -229,6 +236,7 @@ it("creates a new camera before storing viewport capsule screenshots from direct
   expect(state.selectedObjectId).toBe("cam_object_2");
   expect(originalCamera?.captures).toEqual([]);
   expect(newCamera?.fov).toBe(64);
+  expect((newCamera as typeof newCamera & { transientCaptureToken?: string })?.transientCaptureToken).toBeUndefined();
   expect(newCamera?.transform.position).toEqual(getCameraRigPositionFromViewSnapshot(snapshot));
   expect(getCameraViewSnapshotFromShot(newCamera)).toEqual(snapshot);
   expect(newCamera?.captures).toEqual([
@@ -292,6 +300,535 @@ it("stores viewport capsule screenshots in the current camera while already in c
     "机位02-截图04",
   ]);
   expect(activeCamera?.lastCaptureUrl).toBe("data:image/png;base64,camera-view-4");
+});
+
+it("discards a deferred camera-view result when the target camera is replaced", async () => {
+  const user = userEvent.setup();
+  let resolveCapture: ((value: ScreenshotResult[]) => void) | undefined;
+  const handler = vi.fn(
+    () =>
+      new Promise<ScreenshotResult[]>((resolve) => {
+        resolveCapture = resolve;
+      })
+  );
+  const cameraId = useDirectorStore.getState().addCameraShot();
+  useDirectorStore.getState().setViewMode("camera");
+
+  setViewportCaptureHandler(handler);
+  render(<ViewportToolbar />);
+
+  await user.click(screen.getByRole("button", { name: "当前视角截图" }));
+  await waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+  await act(async () => {
+    useDirectorStore.getState().deleteSelectedObject();
+    expect(useDirectorStore.getState().project.cameras.some((camera) => camera.id === cameraId)).toBe(false);
+    expect(useDirectorStore.getState().addCameraShot()).toBe(cameraId);
+  });
+
+  await act(async () => {
+    resolveCapture?.([
+      {
+        label: "过期相机结果",
+        dataUrl: "data:image/png;base64,stale-existing-camera",
+        meta: {
+          mode: "camera",
+          cameraId,
+          fov: 50,
+          position: [0, 1, 5],
+          target: [0, 1, 0],
+        },
+      },
+    ]);
+  });
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("截图目标已变化，本次结果已丢弃");
+  expect(useDirectorStore.getState().project.cameras.find((camera) => camera.id === cameraId)?.captures).toEqual([]);
+});
+
+it("keeps a user-selected director view after a deferred camera-view capture failure", async () => {
+  const user = userEvent.setup();
+  let rejectCapture: ((reason?: unknown) => void) | undefined;
+  const handler = vi.fn(
+    () =>
+      new Promise<never>((_resolve, reject) => {
+        rejectCapture = reject;
+      })
+  );
+  useDirectorStore.getState().addCameraShot();
+  useDirectorStore.getState().setViewMode("camera");
+
+  setViewportCaptureHandler(handler);
+  render(<ViewportToolbar />);
+
+  await user.click(screen.getByRole("button", { name: "当前视角截图" }));
+  await waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+  await act(async () => {
+    useDirectorStore.getState().setViewMode("director");
+    rejectCapture?.(new Error("相机视角延迟失败"));
+  });
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("相机视角延迟失败");
+  expect(useDirectorStore.getState().viewMode).toBe("director");
+});
+
+it("single-flights capture requests and re-enables all capture buttons after settlement", async () => {
+  const user = userEvent.setup();
+  const result = {
+    label: "当前机位",
+    dataUrl: "data:image/png;base64,single-flight",
+    meta: {
+      mode: "camera" as const,
+      cameraId: "cam_2",
+      fov: 50,
+      position: [0, 1, 5] as [number, number, number],
+      target: [0, 1, 0] as [number, number, number],
+    },
+  };
+  let resolveCapture: ((value: typeof result[]) => void) | undefined;
+  const handler = vi.fn(
+    () =>
+      new Promise<typeof result[]>((resolve) => {
+        resolveCapture = resolve;
+      })
+  );
+
+  setViewportCaptureHandler(handler);
+  render(<ViewportToolbar />);
+
+  const captureButtons = [
+    screen.getByRole("button", { name: "当前视角截图" }),
+    screen.getByRole("button", { name: "四方位截图" }),
+    screen.getByRole("button", { name: "十二方位截图" }),
+  ];
+
+  await user.click(captureButtons[0]!);
+  await waitFor(() => {
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(useDirectorStore.getState().project.cameras).toHaveLength(2);
+  });
+
+  await user.click(captureButtons[0]!);
+  expect(handler).toHaveBeenCalledTimes(1);
+  captureButtons.forEach((button) => expect(button).toBeDisabled());
+
+  await act(async () => {
+    resolveCapture?.([result]);
+  });
+
+  await waitFor(() => captureButtons.forEach((button) => expect(button).not.toBeDisabled()));
+  expect(useDirectorStore.getState().project.cameras).toHaveLength(2);
+});
+
+it("drops a stale director capture response after a same-id replacement camera is created", async () => {
+  const user = userEvent.setup();
+  const result = {
+    label: "过期机位",
+    dataUrl: "data:image/png;base64,stale-camera",
+    meta: {
+      mode: "camera" as const,
+      cameraId: "cam_2",
+      fov: 50,
+      position: [0, 1, 5] as [number, number, number],
+      target: [0, 1, 0] as [number, number, number],
+    },
+  };
+  let resolveCapture: ((value: typeof result[]) => void) | undefined;
+  const handler = vi.fn(
+    () =>
+      new Promise<typeof result[]>((resolve) => {
+        resolveCapture = resolve;
+      })
+  );
+  const beforeState = useDirectorStore.getState();
+
+  setViewportCaptureHandler(handler);
+  render(<ViewportToolbar getViewportCameraSnapshot={() => ({ fov: 50, position: [0, 1, 5], target: [0, 1, 0] })} />);
+
+  await user.click(screen.getByRole("button", { name: "当前视角截图" }));
+  await waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+  await act(async () => {
+    useDirectorStore.getState().undo();
+    expect(useDirectorStore.getState().project.cameras).toHaveLength(1);
+    expect(useDirectorStore.getState().viewMode).toBe(beforeState.viewMode);
+    expect(useDirectorStore.getState().addCameraShot()).toBe("cam_2");
+  });
+
+  const replacementBeforeResponse = useDirectorStore.getState();
+  await act(async () => {
+    resolveCapture?.([result]);
+  });
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("截图目标已变化");
+  const replacementAfterResponse = useDirectorStore.getState();
+  const replacement = replacementAfterResponse.project.cameras.find((camera) => camera.id === "cam_2");
+
+  expect(replacement?.captures).toEqual([]);
+  expect(replacement?.transientCaptureToken).toBeUndefined();
+  expect(replacementAfterResponse.project).toEqual(replacementBeforeResponse.project);
+  expect(replacementAfterResponse.viewMode).toBe(replacementBeforeResponse.viewMode);
+  expect(replacementAfterResponse.project.activeCameraId).toBe(replacementBeforeResponse.project.activeCameraId);
+  expect(replacementAfterResponse.selectedObjectId).toBe(replacementBeforeResponse.selectedObjectId);
+  expect(replacementAfterResponse.selectedObjectIds).toEqual(replacementBeforeResponse.selectedObjectIds);
+  expect(replacementAfterResponse.selectedCrowdId).toBe(replacementBeforeResponse.selectedCrowdId);
+});
+
+it("shows an accessible error when local model reading rejects", async () => {
+  const user = userEvent.setup();
+  mockReadLocalModelFile.mockRejectedValue(new Error("本地模型读取失败"));
+  render(<ViewportToolbar />);
+
+  await user.click(screen.getByRole("button", { name: "导入本地模型" }));
+  await user.upload(
+    screen.getByTestId("scene-local-model-input") as HTMLInputElement,
+    new File(["broken"], "broken.obj", { type: "model/obj" })
+  );
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("本地模型读取失败");
+});
+
+it("shows an accessible error when panorama reading rejects", async () => {
+  const user = userEvent.setup();
+  mockReadPanoramaFile.mockRejectedValue(new Error("全景图读取失败"));
+  render(<ViewportToolbar />);
+
+  await user.click(screen.getByRole("button", { name: "导入全景图" }));
+  const panoramaInput = document.querySelector('input[accept=".jpg,.jpeg,.png,.webp"]') as HTMLInputElement | null;
+  expect(panoramaInput).not.toBeNull();
+
+  await user.upload(panoramaInput!, new File(["broken"], "broken.jpg", { type: "image/jpeg" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("全景图读取失败");
+});
+
+it("does not let an older local success clear a newer panorama failure", async () => {
+  const user = userEvent.setup();
+  let resolveLocal: ((value: { id: string; fileName: string; url: string }) => void) | undefined;
+  mockReadLocalModelFile.mockImplementationOnce(
+    () =>
+      new Promise<{ id: string; fileName: string; url: string }>((resolve) => {
+        resolveLocal = resolve;
+      })
+  );
+  mockReadPanoramaFile.mockRejectedValueOnce(new Error("最新全景图失败"));
+  render(<ViewportToolbar />);
+
+  await user.click(screen.getByRole("button", { name: "导入本地模型" }));
+  await user.upload(
+    screen.getByTestId("scene-local-model-input") as HTMLInputElement,
+    new File(["pending"], "pending.obj", { type: "model/obj" })
+  );
+  await user.click(screen.getByRole("button", { name: "导入全景图" }));
+  const panoramaInput = document.querySelector('input[accept=".jpg,.jpeg,.png,.webp"]') as HTMLInputElement | null;
+  expect(panoramaInput).not.toBeNull();
+  await user.upload(panoramaInput!, new File(["broken"], "broken.jpg", { type: "image/jpeg" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("最新全景图失败");
+  await act(async () => {
+    resolveLocal?.({ id: "late-local", fileName: "pending.obj", url: "blob:pending" });
+  });
+
+  expect(screen.getByRole("alert")).toHaveTextContent("最新全景图失败");
+});
+
+it("does not let an older capture failure overwrite a newer local success", async () => {
+  const user = userEvent.setup();
+  let rejectCapture: ((reason?: unknown) => void) | undefined;
+  const handler = vi.fn(
+    () =>
+      new Promise<never>((_resolve, reject) => {
+        rejectCapture = reject;
+      })
+  );
+  mockReadLocalModelFile.mockResolvedValueOnce({
+    id: "local-success",
+    fileName: "success.obj",
+    url: "blob:success",
+  });
+  setViewportCaptureHandler(handler);
+  render(<ViewportToolbar />);
+
+  await user.click(screen.getByRole("button", { name: "当前视角截图" }));
+  await waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+  await user.click(screen.getByRole("button", { name: "导入本地模型" }));
+  await user.upload(
+    screen.getByTestId("scene-local-model-input") as HTMLInputElement,
+    new File(["success"], "success.obj", { type: "model/obj" })
+  );
+  await waitFor(() => {
+    expect(useDirectorStore.getState().project.assets.some((asset) => asset.url === "blob:success")).toBe(true);
+  });
+
+  await act(async () => {
+    rejectCapture?.(new Error("旧截图失败"));
+  });
+
+  await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+  expect(useDirectorStore.getState().project.cameras).toHaveLength(1);
+});
+
+it("remounts the viewport error alert when the same error is retried", async () => {
+  const user = userEvent.setup();
+  mockReadLocalModelFile.mockRejectedValue(new Error("相同错误"));
+  render(<ViewportToolbar />);
+  const input = screen.getByTestId("scene-local-model-input") as HTMLInputElement;
+
+  await user.click(screen.getByRole("button", { name: "导入本地模型" }));
+  await user.upload(input, new File(["broken"], "first.obj", { type: "model/obj" }));
+  const firstAlert = await screen.findByRole("alert");
+
+  await user.click(screen.getByRole("button", { name: "导入本地模型" }));
+  await user.upload(input, new File(["broken"], "second.obj", { type: "model/obj" }));
+  const secondAlert = await screen.findByRole("alert");
+
+  expect(secondAlert).toHaveTextContent("相同错误");
+  expect(secondAlert).not.toBe(firstAlert);
+});
+
+it("rolls back a temporary director camera when capture fails", async () => {
+  const user = userEvent.setup();
+  const snapshot = {
+    fov: 64,
+    position: [3, 2, 1] as [number, number, number],
+    target: [0, 1, -2] as [number, number, number],
+  };
+  const handler = vi.fn(async () => {
+    throw new Error("视口截图失败");
+  });
+  const beforeState = useDirectorStore.getState();
+  const before = JSON.parse(
+    JSON.stringify({
+      cameras: beforeState.project.cameras,
+      objects: beforeState.project.objects,
+      activeCameraId: beforeState.project.activeCameraId,
+      selectedObjectId: beforeState.selectedObjectId,
+      selectedObjectIds: beforeState.selectedObjectIds,
+      selectedCrowdId: beforeState.selectedCrowdId,
+      viewMode: beforeState.viewMode,
+    })
+  );
+
+  setViewportCaptureHandler(handler);
+  render(<ViewportToolbar getViewportCameraSnapshot={() => snapshot} />);
+
+  await user.click(screen.getByRole("button", { name: "当前视角截图" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("视口截图失败");
+  const afterState = useDirectorStore.getState();
+
+  expect(afterState.project.cameras).toEqual(before.cameras);
+  expect(afterState.project.objects).toEqual(before.objects);
+  expect(afterState.project.activeCameraId).toBe(before.activeCameraId);
+  expect(afterState.selectedObjectId).toBe(before.selectedObjectId);
+  expect(afterState.selectedObjectIds).toEqual(before.selectedObjectIds);
+  expect(afterState.selectedCrowdId).toBe(before.selectedCrowdId);
+  expect(afterState.viewMode).toBe(before.viewMode);
+});
+
+it("removes the temporary director camera after a deferred failure while preserving intervening scene additions", async () => {
+  const user = userEvent.setup();
+  let rejectCapture: ((reason?: unknown) => void) | undefined;
+  const handler = vi.fn(
+    () =>
+      new Promise<never>((_resolve, reject) => {
+        rejectCapture = reject;
+      })
+  );
+  useDirectorStore.getState().openSceneInspector();
+  const beforeState = useDirectorStore.getState();
+  const beforeCameraIds = new Set(beforeState.project.cameras.map((camera) => camera.id));
+  const previousActiveCameraId = beforeState.project.activeCameraId;
+  const previousSelectedObjectId = beforeState.selectedObjectId;
+  const previousViewMode = beforeState.viewMode;
+
+  setViewportCaptureHandler(handler);
+  render(<ViewportToolbar getViewportCameraSnapshot={() => ({ fov: 64, position: [3, 2, 1], target: [0, 1, -2] })} />);
+
+  await user.click(screen.getByRole("button", { name: "当前视角截图" }));
+  await waitFor(() => {
+    expect(handler).toHaveBeenCalled();
+    expect(useDirectorStore.getState().project.cameras).toHaveLength(beforeState.project.cameras.length + 1);
+  });
+
+  await act(async () => {
+    useDirectorStore.getState().addPresetCharacter("female");
+  });
+  const addedCharacter = useDirectorStore
+    .getState()
+    .project.objects.find((item) => item.kind === "character" && item.id !== previousSelectedObjectId);
+  expect(addedCharacter).toBeDefined();
+
+  await act(async () => {
+    useDirectorStore.getState().selectObject(addedCharacter!.id);
+    rejectCapture?.(new Error("延迟截图失败"));
+  });
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("延迟截图失败");
+  const afterState = useDirectorStore.getState();
+
+  expect(afterState.project.cameras).toHaveLength(beforeState.project.cameras.length);
+  expect(afterState.project.cameras.every((camera) => beforeCameraIds.has(camera.id))).toBe(true);
+  expect(afterState.project.objects.some((item) => item.id === addedCharacter!.id)).toBe(true);
+  expect(afterState.project.objects.some((item) => item.linkedCameraId === "cam_2")).toBe(false);
+  expect(afterState.project.activeCameraId).toBe(previousActiveCameraId);
+  expect(afterState.selectedObjectId).toBe(previousSelectedObjectId);
+  expect(afterState.viewMode).toBe(previousViewMode);
+  expect(afterState.directorInspectorMode).toBe("scene");
+
+  useDirectorStore.getState().undo();
+  expect(useDirectorStore.getState().directorInspectorMode).toBe("scene");
+});
+
+it("does not roll back UI-only changes made while a capture is pending", async () => {
+  const user = userEvent.setup();
+  let rejectCapture: ((reason?: unknown) => void) | undefined;
+  const handler = vi.fn(
+    () =>
+      new Promise<never>((_resolve, reject) => {
+        rejectCapture = reject;
+      })
+  );
+
+  setViewportCaptureHandler(handler);
+  render(<ViewportToolbar />);
+  await user.click(screen.getByRole("button", { name: "当前视角截图" }));
+  await waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+  const undoLengthWhileCaptureIsPending = useDirectorStore.getState().undoStack.length;
+
+  await act(async () => {
+    useDirectorStore.getState().setTransformMode("rotate");
+  });
+  await act(async () => {
+    rejectCapture?.(new Error("UI 状态期间截图失败"));
+  });
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("UI 状态期间截图失败");
+  expect(useDirectorStore.getState().transformMode).toBe("rotate");
+  expect(useDirectorStore.getState().undoStack).toHaveLength(undoLengthWhileCaptureIsPending);
+});
+
+it("restores full object and crowd selection after a deferred director failure", async () => {
+  const user = userEvent.setup();
+  let rejectCapture: ((reason?: unknown) => void) | undefined;
+  const handler = vi.fn(
+    () =>
+      new Promise<never>((_resolve, reject) => {
+        rejectCapture = reject;
+      })
+  );
+
+  await act(async () => {
+    useDirectorStore.getState().addCrowdCharacters({
+      bodyType: "female",
+      rows: 1,
+      columns: 2,
+      spacing: 1,
+    });
+  });
+
+  const beforeState = useDirectorStore.getState();
+  const previousSelectedObjectId = beforeState.selectedObjectId;
+  const previousSelectedObjectIds = [...beforeState.selectedObjectIds];
+  const previousSelectedCrowdId = beforeState.selectedCrowdId;
+
+  setViewportCaptureHandler(handler);
+  render(<ViewportToolbar getViewportCameraSnapshot={() => ({ fov: 64, position: [3, 2, 1], target: [0, 1, -2] })} />);
+
+  await user.click(screen.getByRole("button", { name: "当前视角截图" }));
+  await waitFor(() => {
+    expect(handler).toHaveBeenCalled();
+    expect(useDirectorStore.getState().project.cameras).toHaveLength(beforeState.project.cameras.length + 1);
+  });
+
+  let addedCharacterId: string | undefined;
+  await act(async () => {
+    useDirectorStore.getState().addPresetCharacter("female");
+    addedCharacterId = useDirectorStore.getState().selectedObjectId ?? undefined;
+  });
+  expect(addedCharacterId).toBeDefined();
+
+  await act(async () => {
+    rejectCapture?.(new Error("延迟选择恢复失败"));
+  });
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("延迟选择恢复失败");
+  const afterState = useDirectorStore.getState();
+
+  expect(afterState.project.objects.some((item) => item.id === addedCharacterId)).toBe(true);
+  expect(afterState.selectedObjectId).toBe(previousSelectedObjectId);
+  expect(afterState.selectedObjectIds).toEqual(previousSelectedObjectIds);
+  expect(afterState.selectedCrowdId).toBe(previousSelectedCrowdId);
+});
+
+it("keeps existing cameras when a camera-view capture fails and restores the original view mode", async () => {
+  const user = userEvent.setup();
+  const handler = vi.fn(async () => {
+    throw new Error("机位截图失败");
+  });
+  useDirectorStore.getState().addCameraShot({
+    fov: 58,
+    position: [1, 2, 6],
+    target: [0, 1, 0],
+  });
+  useDirectorStore.getState().setViewMode("camera");
+  const beforeState = useDirectorStore.getState();
+  const beforeCameras = JSON.parse(JSON.stringify(beforeState.project.cameras));
+  const beforeActiveCameraId = beforeState.project.activeCameraId;
+  const beforeViewMode = beforeState.viewMode;
+
+  setViewportCaptureHandler(handler);
+  render(<ViewportToolbar />);
+
+  await user.click(screen.getByRole("button", { name: "当前视角截图" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("机位截图失败");
+  const afterState = useDirectorStore.getState();
+
+  expect(afterState.project.cameras).toEqual(beforeCameras);
+  expect(afterState.project.activeCameraId).toBe(beforeActiveCameraId);
+  expect(afterState.viewMode).toBe(beforeViewMode);
+});
+
+it("clears old operation errors after successful transform and add actions", async () => {
+  const user = userEvent.setup();
+  mockReadLocalModelFile
+    .mockRejectedValueOnce(new Error("第一次读取失败"))
+    .mockRejectedValueOnce(new Error("第二次读取失败"))
+    .mockResolvedValueOnce({
+      id: "local-model-success",
+      fileName: "success.obj",
+      name: "成功模型",
+      url: "blob:success-model",
+    });
+  render(<ViewportToolbar />);
+
+  await user.click(screen.getByRole("button", { name: "导入本地模型" }));
+  const input = screen.getByTestId("scene-local-model-input") as HTMLInputElement;
+  await user.upload(input, new File(["broken"], "broken.obj", { type: "model/obj" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("第一次读取失败");
+
+  await user.click(screen.getByRole("button", { name: "旋转" }));
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: "导入本地模型" }));
+  await user.upload(input, new File(["broken-again"], "broken-again.obj", { type: "model/obj" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("第二次读取失败");
+
+  await user.click(screen.getByRole("button", { name: "导入本地模型" }));
+  await user.upload(input, new File(["success"], "success.obj", { type: "model/obj" }));
+  await waitFor(() => {
+    expect(useDirectorStore.getState().project.assets.some((asset) => asset.fileName === "success.obj")).toBe(true);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  await user.click(screen.getByRole("button", { name: "添加角色" }));
+  await user.click(screen.getByRole("menuitem", { name: "男性素体" }));
+
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(useDirectorStore.getState().project.objects.filter((item) => item.kind === "character")).toHaveLength(2);
 });
 
 it("switches the active transform control mode from the viewport capsule", async () => {

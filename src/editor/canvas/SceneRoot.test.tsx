@@ -1,11 +1,31 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { Box3, Vector3 } from "three";
+import { readFileSync } from "node:fs";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { Box3, Group, Vector3 } from "three";
 import { afterEach, beforeEach, vi } from "vitest";
 import { VIEWPORT_CAMERA_VISUAL_SCALE } from "../schema/cameraGeometry";
 import { createInitialDirectorState, useDirectorStore } from "../store/directorStore";
 import { getImportedModelNormalization, SceneRoot } from "./SceneRoot";
 
 const mockCharacterModelShouldSuspend = vi.hoisted(() => ({ current: false }));
+const mockImportedModelLoad = vi.hoisted(() => ({ failUrls: new Set<string>() }));
+
+vi.mock("@react-three/fiber", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@react-three/fiber")>();
+
+  return {
+    ...actual,
+    useLoader: (_loader: unknown, url: string | string[]) => {
+      const requestedUrl = Array.isArray(url) ? url[0] : url;
+      if (requestedUrl && mockImportedModelLoad.failUrls.has(requestedUrl)) {
+        const error = new Error("模型读取失败") as Error & { _suppressLogging?: boolean };
+        error._suppressLogging = true;
+        throw error;
+      }
+
+      return new Group();
+    },
+  };
+});
 
 vi.mock("@react-three/drei", async () => {
   const actual = await vi.importActual<typeof import("@react-three/drei")>("@react-three/drei");
@@ -155,7 +175,10 @@ vi.mock("../runtime/CharacterModel", async () => {
 
 beforeEach(() => {
   vi.spyOn(console, "error").mockImplementation(() => {});
+  vi.spyOn(window.console, "error").mockImplementation(() => {});
+  window.addEventListener("error", suppressExpectedModelError);
   mockCharacterModelShouldSuspend.current = false;
+  mockImportedModelLoad.failUrls.clear();
   const base = createInitialDirectorState();
   useDirectorStore.setState({
     ...useDirectorStore.getState(),
@@ -177,8 +200,15 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  window.removeEventListener("error", suppressExpectedModelError);
   vi.restoreAllMocks();
 });
+
+function suppressExpectedModelError(event: ErrorEvent) {
+  if (event.error instanceof Error && event.error.message === "模型读取失败") {
+    event.preventDefault();
+  }
+}
 
 function getUniquePoints(points: Array<[number, number, number]>) {
   return Array.from(new Map(points.map((point) => [point.join(","), point])).values());
@@ -315,8 +345,20 @@ it("normalizes imported model bounds to a director-desk friendly size on the gro
   expect(normalization.position[2]).toBeCloseTo(0.2);
 });
 
-it("wraps each imported model in its own loading boundary so the rest of the scene stays mounted", () => {
+it("defines a compact high-contrast non-interactive style for imported asset errors", () => {
+  const styles = readFileSync("src/styles/index.css", "utf8");
+  const rule = styles.match(/\.scene-asset-error-label\s*\{([\s\S]*?)\}/)?.[1] ?? "";
+
+  expect(rule).not.toBe("");
+  expect(rule).toMatch(/color:\s*#fff\b/i);
+  expect(rule).toMatch(/background:\s*#5b1412\b/i);
+  expect(rule).toMatch(/padding:\s*4px\s+8px/i);
+  expect(rule).toMatch(/pointer-events:\s*none/i);
+});
+
+it("isolates a failed imported model while keeping other scene nodes and models mounted", async () => {
   const base = createInitialDirectorState();
+  mockImportedModelLoad.failUrls.add("blob:broken-model");
   useDirectorStore.setState({
     ...useDirectorStore.getState(),
     ...base,
@@ -324,24 +366,44 @@ it("wraps each imported model in its own loading boundary so the rest of the sce
       ...base.project,
       assets: [
         {
-          id: "asset_model_1",
+          id: "asset_broken_model",
           kind: "prop",
           sourceType: "model",
-          fileName: "microwave_low.fbx",
-          url: "blob:microwave",
+          fileName: "坏模型.fbx",
+          url: "blob:broken-model",
+        },
+        {
+          id: "asset_working_model",
+          kind: "prop",
+          sourceType: "model",
+          fileName: "正常模型.obj",
+          url: "blob:working-model",
         },
       ],
       objects: [
         ...base.project.objects,
         {
           id: "obj_model_1",
-          name: "微波炉",
+          name: "坏模型",
           kind: "prop",
           visible: true,
           locked: false,
-          assetRefId: "asset_model_1",
+          assetRefId: "asset_broken_model",
           transform: {
-            position: [0, 0, 0],
+            position: [2, 0, 0],
+            rotation: [0, 0, 0],
+            scale: [1, 1, 1],
+          },
+        },
+        {
+          id: "obj_working_model",
+          name: "正常模型",
+          kind: "prop",
+          visible: true,
+          locked: false,
+          assetRefId: "asset_working_model",
+          transform: {
+            position: [-2, 0, 0],
             rotation: [0, 0, 0],
             scale: [1, 1, 1],
           },
@@ -354,6 +416,36 @@ it("wraps each imported model in its own loading boundary so the rest of the sce
 
   expect(screen.getByText("角色01")).toBeInTheDocument();
   expect(screen.getByText("机位01")).toBeInTheDocument();
+  expect(screen.getByRole("alert")).toHaveTextContent("坏模型.fbx 加载失败");
+
+  const placeholder = document.querySelector('group[name="scene-asset-error-placeholder"]');
+  expect(placeholder).toBeInTheDocument();
+  expect(placeholder?.parentElement).toHaveAttribute("position", "2,0,0");
+
+  const errorWireframeLines = document.querySelectorAll('[data-name^="scene-asset-error-wireframe"]');
+  expect(errorWireframeLines.length).toBeGreaterThan(0);
+  expect(Array.from(errorWireframeLines).every((line) => line.getAttribute("data-color") === "#E0524D")).toBe(true);
+  expect(document.querySelectorAll("primitive")).toHaveLength(1);
+
+  mockImportedModelLoad.failUrls.delete("blob:broken-model");
+  await act(async () => {
+    useDirectorStore.setState((state) => ({
+      ...state,
+      project: {
+        ...state.project,
+        assets: state.project.assets.map((asset) =>
+          asset.id === "asset_broken_model"
+            ? { ...asset, fileName: "恢复模型.obj", url: "blob:recovered-model" }
+            : asset
+        ),
+      },
+    }));
+  });
+
+  await waitFor(() => {
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(document.querySelectorAll("primitive")).toHaveLength(2);
+  });
 });
 
 it("keeps imported model normalization neutral for empty bounds", () => {

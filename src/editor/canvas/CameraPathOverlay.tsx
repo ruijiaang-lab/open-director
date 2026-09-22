@@ -50,7 +50,9 @@ export function CameraPathOverlay() {
       if (isEditableKeyboardTarget(event.target)) return;
 
       const playback = useCameraPlaybackStore.getState();
-      const { selectedHandle, selectedNode } = playback;
+      const activeCameraId = useDirectorStore.getState().project.activeCameraId;
+      const selectedHandle = playback.selectedHandle?.cameraId === activeCameraId ? playback.selectedHandle : null;
+      const selectedNode = playback.selectedNode?.cameraId === activeCameraId ? playback.selectedNode : null;
       if (selectedHandle) {
         // 删除手柄 = 恢复直线三等分默认位置（贝塞尔曲线拉直）
         const { cameraId, segmentId } = selectedHandle;
@@ -141,9 +143,10 @@ function CameraPathLayer({
   const selectedSegment = useCameraPlaybackStore((state) => state.selectedSegment);
   const selectedHandle = useCameraPlaybackStore((state) => state.selectedHandle);
   const pathColor = active ? ACTIVE_PATH_COLOR : INACTIVE_PATH_COLOR;
-  const isSelectedNode = (nodeId: string) => selectedNode?.cameraId === camera.id && selectedNode.nodeId === nodeId;
+  const isSelectedNode = (nodeId: string) =>
+    active && selectedNode?.cameraId === camera.id && selectedNode.nodeId === nodeId;
   const isSelectedSegment = (segmentId: string) =>
-    selectedSegment?.cameraId === camera.id && selectedSegment.segmentId === segmentId;
+    active && selectedSegment?.cameraId === camera.id && selectedSegment.segmentId === segmentId;
 
   if (nodes.length === 0) return null;
 
@@ -191,7 +194,11 @@ function CameraPathLayer({
             segment={segment}
             fromNode={nodes[index]}
             toNode={nodes[index + 1]}
-            selectedHandle={selectedHandle?.cameraId === camera.id && selectedHandle.segmentId === segment.id ? selectedHandle.handle : null}
+            selectedHandle={
+              active && selectedHandle?.cameraId === camera.id && selectedHandle.segmentId === segment.id
+                ? selectedHandle.handle
+                : null
+            }
             onSelect={onHandleSelect}
           />
         );

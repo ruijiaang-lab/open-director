@@ -23,18 +23,36 @@ export function CameraPlaybackController() {
   useFrame((_, delta) => {
     // 帧循环一律读实时 store 而不是渲染闭包/ref：React 重渲染在 rAF 之后，
     // 用旧值会让「停止后不归零」「重点播放直接跳到末尾」这类竞态反复出现
-    if (!useCameraPlaybackStore.getState().isPlaying) return;
+    const playback = useCameraPlaybackStore.getState();
+    if (!playback.isPlaying) return;
 
     const { project } = useDirectorStore.getState();
     const camera = project.cameras.find((item) => item.id === project.activeCameraId);
-    if (!camera?.nodes) return;
+    if (!camera?.nodes || camera.nodes.length < 2) {
+      playback.pause();
+      return;
+    }
 
     const nodes = camera.nodes;
     const segments = camera.segments ?? [];
-    const total = getCameraPathDuration(nodes, segments);
-    const nextTime = Math.min(useCameraPlaybackStore.getState().playheadTime + delta, total);
+    let total: number;
+    try {
+      total = getCameraPathDuration(nodes, segments);
+    } catch {
+      playback.pause();
+      return;
+    }
+    if (!Number.isFinite(total) || total <= 0) {
+      playback.pause();
+      return;
+    }
 
-    applyPlayheadPose(nextTime);
+    const nextTime = Math.min(playback.playheadTime + delta, total);
+    if (!Number.isFinite(nextTime) || !applyPlayheadPose(nextTime)) {
+      playback.pause();
+      return;
+    }
+
     useCameraPlaybackStore.getState().setPlayheadTime(nextTime);
     if (nextTime >= total) {
       useCameraPlaybackStore.getState().pause();
@@ -44,13 +62,18 @@ export function CameraPlaybackController() {
   return null;
 }
 
-function applyPlayheadPose(time: number) {
+function applyPlayheadPose(time: number): boolean {
   const { project } = useDirectorStore.getState();
   const camera = project.cameras.find((item) => item.id === project.activeCameraId);
-  if (!camera?.nodes?.length) return;
+  if (!camera?.nodes?.length) return false;
 
-  const pose = evaluateCameraPath(camera.nodes, camera.segments ?? [], time);
-  if (!pose) return;
+  let pose;
+  try {
+    pose = evaluateCameraPath(camera.nodes, camera.segments ?? [], time);
+  } catch {
+    return false;
+  }
+  if (!pose) return false;
 
   const rotation = pose.rotation as Quaternion;
   useDirectorStore.getState().applyPlaybackPose(camera.id, {
@@ -58,4 +81,5 @@ function applyPlayheadPose(time: number) {
     rotation: [rotation.x, rotation.y, rotation.z, rotation.w],
     fov: pose.fov,
   });
+  return true;
 }

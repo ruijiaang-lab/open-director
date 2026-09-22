@@ -10,13 +10,16 @@ import { useCameraPlaybackStore } from "../store/cameraPlaybackStore";
 vi.mock("@react-three/drei", async () => {
   const { useEffect } = await import("react");
   return {
-    PointerLockControls: ({ onLock, onUnlock }: { onLock?: () => void; onUnlock?: () => void }) => (
-      <div
-        data-testid="mock-pointer-lock"
-        onClick={() => onLock?.()}
-        onDoubleClick={() => onUnlock?.()}
-      />
-    ),
+    PointerLockControls: ({ onLock, onUnlock, selector }: { onLock?: () => void; onUnlock?: () => void; selector?: string }) => {
+      mockPointerLockControls.selector = selector;
+      return (
+        <div
+          data-testid="mock-pointer-lock"
+          onClick={() => onLock?.()}
+          onDoubleClick={() => onUnlock?.()}
+        />
+      );
+    },
     OrbitControls: () => null,
     Grid: () => null,
     GizmoHelper: () => null,
@@ -55,6 +58,7 @@ vi.mock("@react-three/drei", async () => {
 const mockSceneCamera = vi.hoisted(() => ({ camera: null as unknown as PerspectiveCamera }));
 const mockFrameCallbacks = vi.hoisted(() => ({ callbacks: [] as Array<(state: unknown, delta: number) => void> }));
 const mockPerspectiveCameraLifecycle = vi.hoisted(() => ({ deferApply: false }));
+const mockPointerLockControls = vi.hoisted(() => ({ selector: undefined as string | undefined }));
 
 vi.mock("@react-three/fiber", () => ({
   Canvas: ({
@@ -103,6 +107,7 @@ beforeEach(() => {
   vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(() => null);
   mockFrameCallbacks.callbacks.length = 0;
   mockPerspectiveCameraLifecycle.deferApply = false;
+  mockPointerLockControls.selector = undefined;
   if (mockSceneCamera.camera) {
     mockSceneCamera.camera.position.set(0, 0, 0);
     mockSceneCamera.camera.quaternion.set(0, 0, 0, 1);
@@ -131,6 +136,14 @@ it("switches between director and camera view with Space", () => {
 
   pressSpace();
   expect(screen.queryByText(/进入掌镜模式/)).toBeNull();
+});
+
+it("binds pointer lock to the director canvas in camera view", () => {
+  render(<DirectorCanvas />);
+
+  pressSpace();
+
+  expect(mockPointerLockControls.selector).toBe('[data-testid="director-canvas"] canvas');
 });
 
 it("does not write a stale shared-camera pose during the StrictMode mount cleanup", () => {

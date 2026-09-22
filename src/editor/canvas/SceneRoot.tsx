@@ -25,6 +25,7 @@ import { getUE4GroundedLabelY } from "../runtime/ue4Mannequin/ue4MannequinRig";
 import { getEffectiveGroundOpacity } from "./panoramaMath";
 import { getCrowdAnchorTransform } from "../store/directorStore";
 import { CameraPathOverlay } from "./CameraPathOverlay";
+import { SceneAssetErrorBoundary } from "./SceneAssetErrorBoundary";
 
 export { getEffectiveGroundOpacity, getPanoramaRotationRadians } from "./panoramaMath";
 
@@ -519,9 +520,11 @@ function ObjectSceneNode({
       }}
     >
       {isImportedModel && asset ? (
-        <Suspense fallback={null}>
-          <ImportedModel fileName={asset.fileName} url={asset.url} />
-        </Suspense>
+        <SceneAssetErrorBoundary fileName={asset.fileName} resetKey={`${asset.url}:${asset.fileName}`}>
+          <Suspense fallback={null}>
+            <ImportedModel fileName={asset.fileName} url={asset.url} />
+          </Suspense>
+        </SceneAssetErrorBoundary>
       ) : item.kind === "character" ? (
         <>
           <Suspense fallback={null}>

@@ -293,6 +293,7 @@ export function CameraFPSControls({ onLockChange }: { onLockChange?: (locked: bo
 
   return (
     <PointerLockControls
+      selector='[data-testid="director-canvas"] canvas'
       onLock={() => {
         lockedRef.current = true;
         setLocked(true);
