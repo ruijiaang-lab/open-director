@@ -121,6 +121,8 @@ export interface CameraSegment {
 export interface DirectorCameraShot {
   id: string;
   name: string;
+  /** Optional persisted marker for an in-flight viewport capture transaction. */
+  transientCaptureToken?: string;
   fov: number;
   transform: DirectorTransform;
   targetMode: "manual" | "object";
