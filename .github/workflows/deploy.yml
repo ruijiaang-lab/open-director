@@ -13,10 +13,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: ls -la && node -v && npm -v
-      # ponytail: npm ci 在 runner 上触发工作目录消失怪症（疑与手改 lockfile 有关），改用 install；若 lockfile 漂移再回头正规化
-      - run: npm install --no-audit --no-fund
-      - run: ls -la
+      - run: npm ci
       - run: npm run build
       - run: npm test
       - uses: cloudflare/wrangler-action@v3

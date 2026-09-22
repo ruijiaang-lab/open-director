@@ -30,7 +30,6 @@
   },
   "devDependencies": {
     "@react-three/test-renderer": "^8.2.4",
-    "@rollup/rollup-darwin-arm64": "^4.61.1",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",
