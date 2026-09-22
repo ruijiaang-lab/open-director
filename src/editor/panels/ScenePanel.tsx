@@ -9,6 +9,7 @@ import {
   InspectorSection,
 } from "./InspectorControls";
 import { useDirectorStore } from "../store/directorStore";
+import { CapturePanel } from "./CapturePanel";
 
 const PANORAMA_RADIUS_MIN = 10;
 const PANORAMA_RADIUS_MAX = 300;
@@ -302,6 +303,7 @@ export function ScenePanel() {
           />
         </InspectorSection>
       ) : null}
+      <CapturePanel embedded />
     </InspectorPanel>
   );
 }

@@ -3622,6 +3622,71 @@ textarea:focus-visible {
   min-height: 140px;
   max-height: 45vh;
 }
+.ai-assistant-confirmation {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #d49a45;
+  border-radius: 8px;
+  background: rgb(var(--panel-rgb));
+  color: rgb(var(--text-rgb));
+}
+.ai-assistant-confirmation-title {
+  font-weight: 700;
+  color: #ffd27a;
+}
+.ai-assistant-confirmation-summary,
+.ai-assistant-confirmation-note {
+  color: rgb(var(--text-dim-rgb));
+  font-size: 11px;
+  line-height: 1.45;
+}
+.ai-assistant-confirmation-commands {
+  max-height: 28vh;
+  overflow: auto;
+  margin: 0;
+  padding: 8px 8px 8px 28px;
+  border: 1px solid rgb(var(--border-rgb));
+  border-radius: 6px;
+  background: rgb(var(--field-rgb));
+}
+.ai-assistant-confirmation-commands li + li {
+  margin-top: 5px;
+}
+.ai-assistant-command-preview {
+  display: block;
+  color: rgb(var(--text-rgb));
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.ai-assistant-confirmation-actions {
+  display: flex;
+  gap: 8px;
+}
+.ai-assistant-confirmation-actions button {
+  flex: 1;
+  border: 1px solid rgb(var(--border-rgb));
+  border-radius: 6px;
+  padding: 7px 10px;
+  background: rgb(var(--surface-rgb));
+  color: rgb(var(--text-rgb));
+  cursor: pointer;
+  font-size: 12px;
+}
+.ai-assistant-confirmation-actions button:first-child {
+  border-color: #d49a45;
+  background: #9b5d18;
+  color: #fff;
+}
+.ai-assistant-confirmation-actions button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
 .ai-message {
   padding: 8px 10px;
   border-radius: 8px;
@@ -3685,4 +3750,38 @@ textarea:focus-visible {
 .ai-assistant-send-button:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+.viewport-operation-error {
+  position: absolute;
+  left: 50%;
+  bottom: calc(40px + 46px + 10px);
+  z-index: 35;
+  max-width: min(420px, calc(100% - 32px));
+  padding: 8px 12px;
+  border: 1px solid rgb(224 82 77 / 0.72);
+  border-radius: 8px;
+  color: #ffe8e6;
+  background: rgb(88 28 26 / 0.94);
+  box-shadow: var(--ui-shadow-panel);
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: center;
+  transform: translateX(-50%);
+}
+
+.scene-asset-error-label {
+  display: inline-flex;
+  max-width: 180px;
+  padding: 4px 8px;
+  border: 1px solid #ffb4ae;
+  border-radius: 4px;
+  color: #fff;
+  background: #5b1412;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.25;
+  pointer-events: none;
+  user-select: none;
+  white-space: nowrap;
 }

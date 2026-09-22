@@ -3,6 +3,8 @@ import { createDefaultDirectorProject, createInitialDirectorState, useDirectorSt
 import { selectRightPanelKind } from "./directorSelectors";
 import { VIEWPORT_CAMERA_FRUSTUM_DEPTH, getCameraRigPositionFromViewSnapshot } from "../schema/cameraGeometry";
 import { getDirectorObjectFocusTarget } from "../schema/cameraTarget";
+import { MIN_SEGMENT_DURATION } from "../camera/cameraPath";
+import type { DirectorAssetRef } from "../schema/directorProject";
 
 function createMemoryStorage(): Storage {
   const storage = new Map<string, string>();
@@ -363,6 +365,127 @@ it("keeps imported model object ids unique after deleting an earlier model", () 
   expect(new Set(modelObjectIds).size).toBe(modelObjectIds.length);
 });
 
+it("replaces only the current panorama asset while preserving selection, panel, and undo semantics", () => {
+  const initialState = createInitialDirectorState();
+  const previousAssets: DirectorAssetRef[] = [
+    {
+      id: "asset_1",
+      kind: "prop",
+      sourceType: "model",
+      fileName: "model.obj",
+      name: "模型",
+      url: "data:model",
+      assetSource: "local",
+    },
+    {
+      id: "asset_2",
+      kind: "panorama",
+      sourceType: "image",
+      fileName: "stale.jpg",
+      name: "旧的非当前全景",
+      url: "data:image/jpeg;base64,stale",
+      projectionMode: "equirectangular",
+    },
+    {
+      id: "asset_3",
+      kind: "panorama",
+      sourceType: "image",
+      fileName: "current.jpg",
+      name: "当前全景",
+      url: "data:image/jpeg;base64,current",
+      projectionMode: "equirectangular",
+    },
+  ];
+
+  useDirectorStore.setState({
+    ...useDirectorStore.getState(),
+    ...initialState,
+    selectedObjectId: "char_default_a",
+    selectedObjectIds: ["char_default_a"],
+    selectedCrowdId: null,
+    directorInspectorMode: "auto",
+    project: {
+      ...initialState.project,
+      assets: previousAssets,
+      panoramaAssetId: "asset_3",
+    },
+    undoStack: [],
+    undoBatchDepth: 0,
+    undoBatchSnapshot: null,
+    undoBatchHasTrackedChanges: false,
+  });
+
+  useDirectorStore.getState().addImportedAsset({
+    kind: "panorama",
+    name: "新全景",
+    fileName: "new.jpg",
+    url: "data:image/jpeg;base64,new",
+    projectionMode: "equirectangular",
+  });
+
+  const importedState = useDirectorStore.getState();
+  expect(importedState.project.panoramaAssetId).toBe("asset_4");
+  expect(importedState.project.assets.map((asset) => asset.id)).toEqual(["asset_1", "asset_2", "asset_4"]);
+  expect(importedState.project.assets.find((asset) => asset.id === "asset_1")?.url).toBe("data:model");
+  expect(importedState.project.assets.find((asset) => asset.id === "asset_2")?.url).toBe(
+    "data:image/jpeg;base64,stale"
+  );
+  expect(importedState.project.assets.find((asset) => asset.id === "asset_3")).toBeUndefined();
+  expect(importedState.selectedObjectId).toBeNull();
+  expect(importedState.selectedObjectIds).toEqual([]);
+  expect(importedState.directorInspectorMode).toBe("scene");
+  expect(importedState.undoStack).toHaveLength(1);
+
+  importedState.undo();
+
+  const undoneState = useDirectorStore.getState();
+  expect(undoneState.project.panoramaAssetId).toBe("asset_3");
+  expect(undoneState.project.assets.map((asset) => asset.id)).toEqual(["asset_1", "asset_2", "asset_3"]);
+  expect(undoneState.selectedObjectId).toBe("char_default_a");
+  expect(undoneState.selectedObjectIds).toEqual(["char_default_a"]);
+  expect(undoneState.directorInspectorMode).toBe("auto");
+});
+
+it("preserves a model when panoramaAssetId points to a non-panorama asset", () => {
+  const initialState = createInitialDirectorState();
+  const modelAsset: DirectorAssetRef = {
+    id: "asset_1",
+    kind: "prop",
+    sourceType: "model",
+    fileName: "model.obj",
+    name: "模型",
+    url: "data:model",
+    assetSource: "local",
+  };
+
+  useDirectorStore.setState({
+    ...useDirectorStore.getState(),
+    ...initialState,
+    project: {
+      ...initialState.project,
+      assets: [modelAsset],
+      panoramaAssetId: modelAsset.id,
+    },
+    undoStack: [],
+    undoBatchDepth: 0,
+    undoBatchSnapshot: null,
+    undoBatchHasTrackedChanges: false,
+  });
+
+  useDirectorStore.getState().addImportedAsset({
+    kind: "panorama",
+    name: "新全景",
+    fileName: "new.jpg",
+    url: "data:image/jpeg;base64,new",
+    projectionMode: "equirectangular",
+  });
+
+  const state = useDirectorStore.getState();
+  expect(state.project.assets.find((asset) => asset.id === modelAsset.id)).toEqual(modelAsset);
+  expect(state.project.panoramaAssetId).toBe("asset_2");
+  expect(state.project.assets.find((asset) => asset.id === "asset_2")?.kind).toBe("panorama");
+});
+
 it("adds a new camera from the current viewport snapshot", () => {
   useDirectorStore.setState(createInitialDirectorState());
 
@@ -633,6 +756,450 @@ it("undoes the latest scene mutation", () => {
   expect(useDirectorStore.getState().project.objects.filter((item) => item.kind === "character")).toHaveLength(1);
 });
 
+it("marks and finalizes a temporary capture camera without adding undo entries", () => {
+  const actions = useDirectorStore.getState() as ReturnType<typeof useDirectorStore.getState> & {
+    markTemporaryCameraCapture: (cameraId: string, token: string) => void;
+    finalizeTemporaryCameraCapture: (cameraId: string, token: string) => void;
+  };
+  const cameraId = useDirectorStore.getState().addCameraShot();
+  const token = "capture-token-finalize";
+  const undoLengthBeforeMark = useDirectorStore.getState().undoStack.length;
+
+  actions.markTemporaryCameraCapture(cameraId, token);
+
+  expect(
+    (useDirectorStore.getState().project.cameras.find((camera) => camera.id === cameraId) as {
+      transientCaptureToken?: string;
+    })?.transientCaptureToken
+  ).toBe(token);
+  expect(
+    (JSON.parse(localStorage.getItem("storyai-3d-director-desk-demo") ?? "{}") as {
+      project?: { cameras?: Array<{ id: string; transientCaptureToken?: string }> };
+    }).project?.cameras?.find((camera) => camera.id === cameraId)?.transientCaptureToken
+  ).toBe(token);
+  expect(useDirectorStore.getState().undoStack).toHaveLength(undoLengthBeforeMark);
+
+  useDirectorStore.getState().addCameraCaptures(cameraId, ["data:image/png;base64,success"]);
+  actions.finalizeTemporaryCameraCapture(cameraId, token);
+
+  expect(
+    (useDirectorStore.getState().project.cameras.find((camera) => camera.id === cameraId) as {
+      transientCaptureToken?: string;
+    })?.transientCaptureToken
+  ).toBeUndefined();
+  expect(
+    (JSON.parse(localStorage.getItem("storyai-3d-director-desk-demo") ?? "{}") as {
+      project?: { cameras?: Array<{ id: string; transientCaptureToken?: string }> };
+    }).project?.cameras?.find((camera) => camera.id === cameraId)?.transientCaptureToken
+  ).toBeUndefined();
+  expect(useDirectorStore.getState().undoStack).toHaveLength(undoLengthBeforeMark + 1);
+  expect(
+    useDirectorStore.getState().undoStack.some((snapshot) =>
+      snapshot.project.cameras.some(
+        (camera) =>
+          camera.id === cameraId &&
+          (camera as typeof camera & { transientCaptureToken?: string }).transientCaptureToken === token
+      )
+    )
+  ).toBe(false);
+});
+
+it("commits captures only when the temporary camera token still matches", () => {
+  const actions = useDirectorStore.getState() as ReturnType<typeof useDirectorStore.getState> & {
+    markTemporaryCameraCapture: (cameraId: string, token: string) => void;
+    commitTemporaryCameraCapture: (cameraId: string, token: string, dataUrls: string[]) => boolean;
+  };
+  const cameraId = useDirectorStore.getState().addCameraShot();
+  const token = "capture-token-commit";
+  actions.markTemporaryCameraCapture(cameraId, token);
+
+  expect(actions.commitTemporaryCameraCapture(cameraId, token, ["data:image/png;base64,committed"])).toBe(true);
+
+  const committedCamera = useDirectorStore.getState().project.cameras.find((camera) => camera.id === cameraId);
+  expect(committedCamera?.captures?.map((capture) => capture.dataUrl)).toEqual(["data:image/png;base64,committed"]);
+  expect(committedCamera?.transientCaptureToken).toBeUndefined();
+  expect(
+    useDirectorStore.getState().undoStack[useDirectorStore.getState().undoStack.length - 1]?.project.cameras.find(
+      (camera) => camera.id === cameraId
+    )
+      ?.transientCaptureToken
+  ).toBeUndefined();
+
+  const staleCameraId = useDirectorStore.getState().addCameraShot();
+  actions.markTemporaryCameraCapture(staleCameraId, "current-token");
+  const beforeStaleCommit = useDirectorStore.getState().project;
+  expect(actions.commitTemporaryCameraCapture(staleCameraId, "old-token", ["data:image/png;base64,stale"])).toBe(false);
+  expect(useDirectorStore.getState().project).toEqual(beforeStaleCommit);
+});
+
+it("rolls back only the tokenized capture camera and prevents undo from reviving it", () => {
+  const actions = useDirectorStore.getState() as ReturnType<typeof useDirectorStore.getState> & {
+    markTemporaryCameraCapture: (cameraId: string, token: string) => void;
+    rollbackTemporaryCameraCapture: (input: {
+      cameraId: string;
+      token: string;
+      previousActiveCameraId: string | null;
+      previousSelectedObjectId: string | null;
+      previousSelectedObjectIds: string[];
+      previousSelectedCrowdId: string | null;
+      previousViewMode?: "director" | "camera";
+    }) => void;
+  };
+  const before = useDirectorStore.getState();
+  const cameraId = useDirectorStore.getState().addCameraShot();
+  const token = "capture-token-rollback";
+  actions.markTemporaryCameraCapture(cameraId, token);
+  useDirectorStore.getState().addPresetCharacter("female");
+
+  actions.rollbackTemporaryCameraCapture({
+    cameraId,
+    token,
+    previousActiveCameraId: before.project.activeCameraId,
+    previousSelectedObjectId: before.selectedObjectId,
+    previousSelectedObjectIds: [...before.selectedObjectIds],
+    previousSelectedCrowdId: before.selectedCrowdId,
+    previousViewMode: before.viewMode,
+  });
+
+  const afterRollback = useDirectorStore.getState();
+  expect(afterRollback.project.cameras.some((camera) => camera.id === cameraId)).toBe(false);
+  expect(afterRollback.project.objects.some((item) => item.linkedCameraId === cameraId)).toBe(false);
+  expect(afterRollback.project.objects.some((item) => item.kind === "character" && item.id !== "char_default_a")).toBe(true);
+  expect(afterRollback.project.activeCameraId).toBe(before.project.activeCameraId);
+  expect(afterRollback.selectedObjectId).toBe(before.selectedObjectId);
+  expect(afterRollback.selectedObjectIds).toEqual(before.selectedObjectIds);
+  expect(afterRollback.selectedCrowdId).toBe(before.selectedCrowdId);
+  expect(afterRollback.viewMode).toBe(before.viewMode);
+  expect(
+    afterRollback.undoStack.some((snapshot) =>
+      snapshot.project.cameras.some((camera) => camera.id === cameraId)
+    )
+  ).toBe(false);
+
+  afterRollback.undo();
+  expect(useDirectorStore.getState().project.cameras.some((camera) => camera.id === cameraId)).toBe(false);
+});
+
+it("does not remove a replacement camera with the same id when its token is absent", () => {
+  const actions = useDirectorStore.getState() as ReturnType<typeof useDirectorStore.getState> & {
+    markTemporaryCameraCapture: (cameraId: string, token: string) => void;
+    rollbackTemporaryCameraCapture: (input: {
+      cameraId: string;
+      token: string;
+      previousActiveCameraId: string | null;
+      previousSelectedObjectId: string | null;
+      previousSelectedObjectIds: string[];
+      previousSelectedCrowdId: string | null;
+    }) => void;
+  };
+  const before = useDirectorStore.getState();
+  const cameraId = useDirectorStore.getState().addCameraShot();
+  const token = "capture-token-replaced";
+  actions.markTemporaryCameraCapture(cameraId, token);
+  useDirectorStore.getState().undo();
+  const replacementId = useDirectorStore.getState().addCameraShot();
+
+  expect(replacementId).toBe(cameraId);
+  const replacementBeforeRollback = useDirectorStore.getState();
+  actions.rollbackTemporaryCameraCapture({
+    cameraId,
+    token,
+    previousActiveCameraId: before.project.activeCameraId,
+    previousSelectedObjectId: before.selectedObjectId,
+    previousSelectedObjectIds: [...before.selectedObjectIds],
+    previousSelectedCrowdId: before.selectedCrowdId,
+  });
+
+  const state = useDirectorStore.getState();
+  expect(state.project.cameras.some((camera) => camera.id === replacementId)).toBe(true);
+  expect(state.project.objects.some((item) => item.linkedCameraId === replacementId)).toBe(true);
+  expect(
+    (state.project.cameras.find((camera) => camera.id === replacementId) as {
+      transientCaptureToken?: string;
+    })?.transientCaptureToken
+  ).toBeUndefined();
+  expect(state.project).toEqual(replacementBeforeRollback.project);
+  expect(state.viewMode).toBe(replacementBeforeRollback.viewMode);
+  expect(state.project.activeCameraId).toBe(replacementBeforeRollback.project.activeCameraId);
+  expect(state.selectedObjectId).toBe(replacementBeforeRollback.selectedObjectId);
+  expect(state.selectedObjectIds).toEqual(replacementBeforeRollback.selectedObjectIds);
+  expect(state.selectedCrowdId).toBe(replacementBeforeRollback.selectedCrowdId);
+});
+
+it("normalizes only tokenized transaction snapshots to the capture baseline", () => {
+  const actions = useDirectorStore.getState() as ReturnType<typeof useDirectorStore.getState> & {
+    markTemporaryCameraCapture: (cameraId: string, token: string) => void;
+    rollbackTemporaryCameraCapture: (input: {
+      cameraId: string;
+      token: string;
+      previousActiveCameraId: string | null;
+      previousSelectedObjectId: string | null;
+      previousSelectedObjectIds: string[];
+      previousSelectedCrowdId: string | null;
+      previousViewMode?: "director" | "camera";
+      previousDirectorInspectorMode?: "auto" | "scene";
+    }) => void;
+  };
+  const cameraId = useDirectorStore.getState().addCameraShot();
+  const token = "capture-token-snapshot-normalize";
+  actions.markTemporaryCameraCapture(cameraId, token);
+  const tokenizedState = useDirectorStore.getState();
+  useDirectorStore.getState().addPresetCharacter("female");
+  const cameraObjectId = tokenizedState.project.objects.find((item) => item.linkedCameraId === cameraId)?.id;
+  const historicalSnapshot = createInitialDirectorState();
+  const tokenSnapshot = {
+    viewMode: "camera" as const,
+    selectedObjectId: cameraObjectId ?? null,
+    selectedObjectIds: [cameraObjectId ?? "", "char_default_a"],
+    selectedCrowdId: "crowd-that-is-not-in-project",
+    directorInspectorMode: "auto" as const,
+    transformMode: "translate" as const,
+    viewportAspectRatio: "auto" as const,
+    viewportRuleOfThirdsEnabled: false,
+    viewportPanelsCollapsed: false,
+    project: {
+      ...tokenizedState.project,
+      activeCameraId: cameraId,
+    },
+  };
+  useDirectorStore.setState({
+    ...useDirectorStore.getState(),
+    undoStack: [historicalSnapshot, tokenSnapshot],
+    undoBatchSnapshot: tokenSnapshot,
+  });
+
+  actions.rollbackTemporaryCameraCapture({
+    cameraId,
+    token,
+    previousActiveCameraId: "cam_1",
+    previousSelectedObjectId: "char_default_a",
+    previousSelectedObjectIds: ["char_default_a", "missing-object"],
+    previousSelectedCrowdId: null,
+    previousViewMode: "director",
+    previousDirectorInspectorMode: "scene",
+  });
+
+  const state = useDirectorStore.getState();
+  expect(state.undoStack[0]).toEqual(historicalSnapshot);
+  const normalizedSnapshot = state.undoStack[1];
+  expect(normalizedSnapshot?.project.cameras.some((camera) => camera.id === cameraId)).toBe(false);
+  expect(normalizedSnapshot?.project.objects.some((item) => item.linkedCameraId === cameraId)).toBe(false);
+  expect(normalizedSnapshot?.project.activeCameraId).toBe("cam_1");
+  expect(normalizedSnapshot?.viewMode).toBe("director");
+  expect(normalizedSnapshot?.directorInspectorMode).toBe("scene");
+  expect(normalizedSnapshot?.selectedObjectId).toBe("char_default_a");
+  expect(normalizedSnapshot?.selectedObjectIds).toEqual(["char_default_a"]);
+  expect(normalizedSnapshot?.selectedCrowdId).toBeNull();
+  expect(state.undoBatchSnapshot).toEqual(normalizedSnapshot);
+
+  state.undo();
+  expect(useDirectorStore.getState().viewMode).toBe("director");
+  expect(useDirectorStore.getState().directorInspectorMode).toBe("scene");
+  expect(useDirectorStore.getState().selectedObjectId).toBe("char_default_a");
+  expect(useDirectorStore.getState().selectedObjectIds).toEqual(["char_default_a"]);
+  expect(useDirectorStore.getState().selectedCrowdId).toBeNull();
+});
+
+it("removes a trailing no-op undo snapshot after a simple capture rollback", () => {
+  const actions = useDirectorStore.getState() as ReturnType<typeof useDirectorStore.getState> & {
+    markTemporaryCameraCapture: (cameraId: string, token: string) => void;
+    rollbackTemporaryCameraCapture: (input: {
+      cameraId: string;
+      token: string;
+      previousActiveCameraId: string | null;
+      previousSelectedObjectId: string | null;
+      previousSelectedObjectIds: string[];
+      previousSelectedCrowdId: string | null;
+      previousViewMode?: "director" | "camera";
+      previousDirectorInspectorMode?: "auto" | "scene";
+    }) => void;
+  };
+  const before = useDirectorStore.getState();
+  const cameraId = useDirectorStore.getState().addCameraShot();
+  actions.markTemporaryCameraCapture(cameraId, "capture-token-no-op");
+
+  actions.rollbackTemporaryCameraCapture({
+    cameraId,
+    token: "capture-token-no-op",
+    previousActiveCameraId: before.project.activeCameraId,
+    previousSelectedObjectId: before.selectedObjectId,
+    previousSelectedObjectIds: [...before.selectedObjectIds],
+    previousSelectedCrowdId: before.selectedCrowdId,
+    previousViewMode: before.viewMode,
+    previousDirectorInspectorMode: before.directorInspectorMode,
+  });
+
+  expect(useDirectorStore.getState().undoStack).toHaveLength(0);
+});
+
+it("keeps a real user edit as the first undo after capture rollback", () => {
+  const actions = useDirectorStore.getState() as ReturnType<typeof useDirectorStore.getState> & {
+    markTemporaryCameraCapture: (cameraId: string, token: string) => void;
+    rollbackTemporaryCameraCapture: (input: {
+      cameraId: string;
+      token: string;
+      previousActiveCameraId: string | null;
+      previousSelectedObjectId: string | null;
+      previousSelectedObjectIds: string[];
+      previousSelectedCrowdId: string | null;
+      previousViewMode?: "director" | "camera";
+      previousDirectorInspectorMode?: "auto" | "scene";
+    }) => void;
+  };
+  const before = useDirectorStore.getState();
+  const cameraId = useDirectorStore.getState().addCameraShot();
+  const token = "capture-token-real-edit";
+  actions.markTemporaryCameraCapture(cameraId, token);
+  useDirectorStore.getState().addPresetCharacter("female");
+
+  actions.rollbackTemporaryCameraCapture({
+    cameraId,
+    token,
+    previousActiveCameraId: before.project.activeCameraId,
+    previousSelectedObjectId: before.selectedObjectId,
+    previousSelectedObjectIds: [...before.selectedObjectIds],
+    previousSelectedCrowdId: before.selectedCrowdId,
+    previousViewMode: before.viewMode,
+    previousDirectorInspectorMode: before.directorInspectorMode,
+  });
+
+  expect(useDirectorStore.getState().project.objects.some((item) => item.name === "角色02")).toBe(true);
+  useDirectorStore.getState().undo();
+  expect(useDirectorStore.getState().project.objects.some((item) => item.name === "角色02")).toBe(false);
+  expect(useDirectorStore.getState().project.cameras.some((camera) => camera.id === cameraId)).toBe(false);
+});
+
+it("deduplicates adjacent rollback baselines so two undos reach earlier history", () => {
+  const actions = useDirectorStore.getState() as ReturnType<typeof useDirectorStore.getState> & {
+    markTemporaryCameraCapture: (cameraId: string, token: string) => void;
+    rollbackTemporaryCameraCapture: (input: {
+      cameraId: string;
+      token: string;
+      previousActiveCameraId: string | null;
+      previousSelectedObjectId: string | null;
+      previousSelectedObjectIds: string[];
+      previousSelectedCrowdId: string | null;
+      previousViewMode?: "director" | "camera";
+      previousDirectorInspectorMode?: "auto" | "scene";
+    }) => void;
+  };
+
+  useDirectorStore.getState().addPresetCharacter("female");
+  const beforeCapture = useDirectorStore.getState();
+  const cameraId = useDirectorStore.getState().addCameraShot();
+  const token = "capture-token-duplicate-baseline";
+  actions.markTemporaryCameraCapture(cameraId, token);
+  useDirectorStore.getState().addPresetCharacter("broad");
+
+  actions.rollbackTemporaryCameraCapture({
+    cameraId,
+    token,
+    previousActiveCameraId: beforeCapture.project.activeCameraId,
+    previousSelectedObjectId: beforeCapture.selectedObjectId,
+    previousSelectedObjectIds: [...beforeCapture.selectedObjectIds],
+    previousSelectedCrowdId: beforeCapture.selectedCrowdId,
+    previousViewMode: beforeCapture.viewMode,
+    previousDirectorInspectorMode: beforeCapture.directorInspectorMode,
+  });
+
+  expect(useDirectorStore.getState().project.objects.some((item) => item.name === "角色02")).toBe(true);
+  expect(useDirectorStore.getState().project.objects.some((item) => item.name === "角色03")).toBe(true);
+
+  useDirectorStore.getState().undo();
+  expect(useDirectorStore.getState().project.objects.some((item) => item.name === "角色03")).toBe(false);
+  expect(useDirectorStore.getState().project.objects.some((item) => item.name === "角色02")).toBe(true);
+
+  const afterFirstUndo = JSON.stringify(useDirectorStore.getState().project);
+  useDirectorStore.getState().undo();
+  expect(JSON.stringify(useDirectorStore.getState().project)).not.toBe(afterFirstUndo);
+  expect(useDirectorStore.getState().project.objects.some((item) => item.name === "角色02")).toBe(false);
+});
+
+it("removes transient capture cameras and linked objects during persisted hydration", () => {
+  const project = createDefaultDirectorProject();
+  const temporaryCameraId = "cam_hydration_temp";
+  const temporaryObjectId = "cam_object_hydration_temp";
+  const temporaryObject = {
+    ...project.objects.find((item) => item.kind === "camera")!,
+    id: temporaryObjectId,
+    name: "临时机位",
+    linkedCameraId: temporaryCameraId,
+  };
+  project.cameras = [
+    {
+      ...project.cameras[0]!,
+      targetMode: "object",
+      targetObjectId: temporaryObjectId,
+    },
+    {
+      ...project.cameras[0]!,
+      id: temporaryCameraId,
+      name: "临时机位",
+      transientCaptureToken: "hydrate-token",
+    },
+  ];
+  project.objects = [...project.objects, temporaryObject];
+  project.activeCameraId = temporaryCameraId;
+
+  localStorage.setItem(
+    "storyai-3d-director-desk-demo",
+    JSON.stringify({
+      ...createInitialDirectorState(),
+      viewMode: "camera",
+      selectedObjectId: temporaryObjectId,
+      selectedObjectIds: [temporaryObjectId, "char_default_a"],
+      selectedCrowdId: "temporary-crowd",
+      project,
+    })
+  );
+
+  const hydratedState = createInitialDirectorState({ includePersistedScene: true });
+  expect(hydratedState.project.cameras.some((camera) => camera.id === temporaryCameraId)).toBe(false);
+  expect(hydratedState.project.objects.some((item) => item.id === temporaryObjectId)).toBe(false);
+  expect(hydratedState.project.objects.some((item) => item.id === "char_default_a")).toBe(true);
+  expect(hydratedState.project.activeCameraId).toBe("cam_1");
+  expect(hydratedState.project.cameras[0]?.targetObjectId).toBeNull();
+  expect(hydratedState.selectedObjectId).toBeNull();
+  expect(hydratedState.selectedObjectIds).toEqual(["char_default_a"]);
+  expect(hydratedState.selectedCrowdId).toBeNull();
+});
+
+it("sanitizes transient capture cameras from a persisted project-shaped import", () => {
+  const project = createDefaultDirectorProject();
+  project.cameras.push({ ...project.cameras[0]!, id: "cam_import_temp", transientCaptureToken: "import-token" });
+  project.objects.push({
+    ...project.objects.find((item) => item.kind === "camera")!,
+    id: "cam_object_import_temp",
+    linkedCameraId: "cam_import_temp",
+  });
+
+  localStorage.setItem("storyai-3d-director-desk-demo", JSON.stringify(project));
+
+  const hydratedState = createInitialDirectorState({ includePersistedScene: true });
+  expect(hydratedState.project.cameras.some((camera) => camera.id === "cam_import_temp")).toBe(false);
+  expect(hydratedState.project.objects.some((item) => item.id === "cam_object_import_temp")).toBe(false);
+  expect(hydratedState.project.cameras).toHaveLength(1);
+  expect(hydratedState.project.objects).toHaveLength(2);
+});
+
+it("sanitizes transient capture cameras when replacing an imported project", () => {
+  const project = createDefaultDirectorProject();
+  project.cameras.push({ ...project.cameras[0]!, id: "cam_replace_temp", transientCaptureToken: "replace-token" });
+  project.objects.push({
+    ...project.objects.find((item) => item.kind === "camera")!,
+    id: "cam_object_replace_temp",
+    linkedCameraId: "cam_replace_temp",
+  });
+
+  useDirectorStore.getState().replaceProject(project);
+
+  const state = useDirectorStore.getState();
+  expect(state.project.cameras.some((camera) => camera.id === "cam_replace_temp")).toBe(false);
+  expect(state.project.objects.some((item) => item.id === "cam_object_replace_temp")).toBe(false);
+  expect(state.project.cameras).toHaveLength(1);
+  expect(state.project.objects).toHaveLength(2);
+});
+
 it("groups repeated transform updates into one undo step while batching", () => {
   useDirectorStore.getState().beginUndoBatch();
   useDirectorStore.getState().updateObjectTransform("char_default_a", { position: [1, 0, 0] });
@@ -781,5 +1348,59 @@ describe("syncCameraPose", () => {
     expect(camera?.targetMode).toBe("object");
     expect(camera?.targetObjectId).toBe(targetObject!.id);
     expect(camera?.target).toEqual(getDirectorObjectFocusTarget(targetObject!));
+  });
+});
+
+describe("updateCameraSegment", () => {
+  function recordTwoNodes() {
+    useDirectorStore.getState().recordCameraNode("cam_1", {
+      position: [0, 1.55, 5.4],
+      rotation: [0, 0, 0, 1],
+      fov: 50,
+    });
+    useDirectorStore.getState().recordCameraNode("cam_1", {
+      position: [1, 1.55, 4.4],
+      rotation: [0, 0, 0, 1],
+      fov: 50,
+    });
+  }
+
+  it("applies an explicit zero hold while preserving omitted duration and rebuilding node time", () => {
+    recordTwoNodes();
+    const segmentId = useDirectorStore.getState().project.cameras[0]?.segments?.[0]?.id;
+
+    expect(segmentId).toBeTruthy();
+    useDirectorStore.getState().updateCameraSegment("cam_1", segmentId!, { holdAfter: 0.5 });
+    useDirectorStore.getState().updateCameraSegment("cam_1", segmentId!, { holdAfter: 0 });
+
+    const camera = useDirectorStore.getState().project.cameras[0]!;
+    expect(camera.segments?.[0]).toMatchObject({ duration: 1, holdAfter: 0 });
+    expect(camera.nodes?.map((node) => node.time)).toEqual([0, 1]);
+
+    useDirectorStore.getState().undo();
+
+    const undoneCamera = useDirectorStore.getState().project.cameras[0]!;
+    expect(undoneCamera.segments?.[0]).toMatchObject({ duration: 1, holdAfter: 0.5 });
+    expect(undoneCamera.nodes?.map((node) => node.time)).toEqual([0, 1.5]);
+  });
+
+  it("clamps an explicit zero duration instead of treating it as omitted", () => {
+    recordTwoNodes();
+    const segmentId = useDirectorStore.getState().project.cameras[0]?.segments?.[0]?.id;
+
+    expect(segmentId).toBeTruthy();
+    useDirectorStore.getState().updateCameraSegment("cam_1", segmentId!, { holdAfter: 0.5 });
+    useDirectorStore.getState().updateCameraSegment("cam_1", segmentId!, { duration: 0 });
+
+    const camera = useDirectorStore.getState().project.cameras[0]!;
+    expect(camera.segments?.[0]?.duration).toBe(MIN_SEGMENT_DURATION);
+    expect(camera.segments?.[0]?.holdAfter).toBe(0.5);
+    expect(camera.nodes?.map((node) => node.time)).toEqual([0, MIN_SEGMENT_DURATION + 0.5]);
+
+    useDirectorStore.getState().undo();
+
+    const undoneCamera = useDirectorStore.getState().project.cameras[0]!;
+    expect(undoneCamera.segments?.[0]).toMatchObject({ duration: 1, holdAfter: 0.5 });
+    expect(undoneCamera.nodes?.map((node) => node.time)).toEqual([0, 1.5]);
   });
 });

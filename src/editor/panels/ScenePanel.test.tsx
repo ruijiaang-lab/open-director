@@ -21,6 +21,17 @@ it("uses the provided right inspector layout for scene properties", () => {
   expect(screen.getByLabelText("场景平移 X").closest(".inspector-axis-input")).toBeInTheDocument();
 });
 
+it("mounts the project controls as an accessible section after the scene controls", () => {
+  const { container } = render(<ScenePanel />);
+
+  const projectHeading = screen.getByRole("heading", { name: "工程" });
+  expect(projectHeading).toBeInTheDocument();
+  expect(projectHeading.closest(".inspector-section")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "导出工程 JSON" })).toBeInTheDocument();
+  expect(container.querySelectorAll(".right-inspector")).toHaveLength(1);
+  expect(container.querySelectorAll(".panel-card")).toHaveLength(1);
+});
+
 it("lays scene switches out in one row and only toggles from the checkbox", async () => {
   const user = userEvent.setup();
   const { container } = render(<ScenePanel />);

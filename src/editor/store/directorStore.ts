@@ -63,6 +63,17 @@ export interface CrowdCharactersInput {
   spacing: number;
 }
 
+export interface TemporaryCameraCaptureRollbackInput {
+  cameraId: string;
+  token: string;
+  previousActiveCameraId: string | null;
+  previousSelectedObjectId: string | null;
+  previousSelectedObjectIds: string[];
+  previousSelectedCrowdId: string | null;
+  previousViewMode?: ViewMode;
+  previousDirectorInspectorMode: "auto" | "scene";
+}
+
 export interface DirectorStateOptions {
   includePersistedLocalAssets?: boolean;
   includePersistedScene?: boolean;
@@ -196,6 +207,10 @@ export interface DirectorActions {
   copySelectedObjects: () => void;
   pasteClipboardObjects: () => void;
   undo: () => void;
+  markTemporaryCameraCapture: (cameraId: string, token: string) => void;
+  commitTemporaryCameraCapture: (cameraId: string, token: string, dataUrls: string[]) => boolean;
+  finalizeTemporaryCameraCapture: (cameraId: string, token: string) => void;
+  rollbackTemporaryCameraCapture: (input: TemporaryCameraCaptureRollbackInput) => void;
   openScopedScene: (scopeId: string | null | undefined) => void;
   replaceProject: (project: DirectorProject) => void;
   saveLatestSnapshot: () => void;
@@ -484,7 +499,7 @@ function withPersistedLocalAssets(project: DirectorProject, includePersistedLoca
 }
 
 function migrateDirectorProject(project: DirectorProject): DirectorProject {
-  return {
+  const migratedProject: DirectorProject = {
     ...project,
     objects: project.objects.map((object) => {
       if (object.kind !== "character") return object;
@@ -505,6 +520,8 @@ function migrateDirectorProject(project: DirectorProject): DirectorProject {
       camera.nodes && camera.nodes.length >= 2 ? rebuildCameraTiming(camera) : camera
     ),
   };
+
+  return removeTransientCaptureCamerasFromProject(migratedProject).project;
 }
 
 function extractPersistedDirectorState(state: DirectorRuntimeState): DirectorState {
@@ -559,23 +576,35 @@ function readPersistedDirectorState(options: DirectorStateOptions = {}): Directo
     const state = parsed as Partial<DirectorState>;
     if (!isDirectorProjectShape(state.project)) return null;
 
+    const migratedProject = withPersistedLocalAssets(
+      migrateDirectorProject(cloneJsonValue(state.project)),
+      options.includePersistedLocalAssets
+    );
+    const objectIds = new Set(migratedProject.objects.map((item) => item.id));
+
     return {
       viewMode: state.viewMode === "camera" ? "camera" : "director",
-      selectedObjectId: typeof state.selectedObjectId === "string" ? state.selectedObjectId : null,
+      selectedObjectId:
+        typeof state.selectedObjectId === "string" && objectIds.has(state.selectedObjectId)
+          ? state.selectedObjectId
+          : null,
       selectedObjectIds: Array.isArray(state.selectedObjectIds)
-        ? state.selectedObjectIds.filter((item): item is string => typeof item === "string")
+        ? state.selectedObjectIds.filter(
+            (item): item is string => typeof item === "string" && objectIds.has(item)
+          )
         : [],
-      selectedCrowdId: typeof state.selectedCrowdId === "string" ? state.selectedCrowdId : null,
+      selectedCrowdId:
+        typeof state.selectedCrowdId === "string" &&
+        migratedProject.objects.some((item) => item.crowdId === state.selectedCrowdId)
+          ? state.selectedCrowdId
+          : null,
       directorInspectorMode: state.directorInspectorMode === "scene" ? "scene" : "auto",
       transformMode:
         state.transformMode === "rotate" || state.transformMode === "scale" ? state.transformMode : "translate",
       viewportAspectRatio: state.viewportAspectRatio ?? "auto",
       viewportRuleOfThirdsEnabled: Boolean(state.viewportRuleOfThirdsEnabled),
       viewportPanelsCollapsed: Boolean(state.viewportPanelsCollapsed),
-      project: withPersistedLocalAssets(
-        migrateDirectorProject(cloneJsonValue(state.project)),
-        options.includePersistedLocalAssets
-      ),
+      project: migratedProject,
     };
   } catch {
     return null;
@@ -784,6 +813,17 @@ function buildCameraCaptures(camera: DirectorCameraShot, dataUrls: string[]) {
       dataUrl,
     };
   });
+}
+
+function appendCameraCaptures(camera: DirectorCameraShot, dataUrls: string[]): DirectorCameraShot {
+  if (dataUrls.length === 0) return camera;
+
+  const nextCaptures = buildCameraCaptures(camera, dataUrls);
+  return {
+    ...camera,
+    lastCaptureUrl: nextCaptures[nextCaptures.length - 1]?.dataUrl ?? camera.lastCaptureUrl ?? null,
+    captures: [...(camera.captures ?? []), ...nextCaptures],
+  };
 }
 
 function createDisplayNameFromFileName(fileName: string) {
@@ -1176,6 +1216,179 @@ function isSameDirectorState(a: DirectorState, b: DirectorState) {
 
 function trimUndoStack(stack: DirectorState[]) {
   return stack.length > UNDO_STACK_LIMIT ? stack.slice(stack.length - UNDO_STACK_LIMIT) : stack;
+}
+
+function clearTemporaryCaptureTokenFromProject(
+  project: DirectorProject,
+  cameraId: string,
+  token: string
+): DirectorProject {
+  let changed = false;
+  const cameras = project.cameras.map((camera) => {
+    if (camera.id !== cameraId || camera.transientCaptureToken !== token) return camera;
+
+    changed = true;
+    const { transientCaptureToken: _transientCaptureToken, ...cameraWithoutToken } = camera;
+    return cameraWithoutToken;
+  });
+
+  return changed ? { ...project, cameras } : project;
+}
+
+function removeTransientCaptureCamerasFromProject(project: DirectorProject): {
+  project: DirectorProject;
+  removedCameraIds: Set<string>;
+  removedObjectIds: Set<string>;
+} {
+  const removedCameraIds = new Set(
+    project.cameras
+      .filter((camera) => camera.transientCaptureToken !== undefined)
+      .map((camera) => camera.id)
+  );
+
+  if (removedCameraIds.size === 0) {
+    return {
+      project,
+      removedCameraIds,
+      removedObjectIds: new Set<string>(),
+    };
+  }
+
+  const removedObjectIds = new Set(
+    project.objects
+      .filter((item) => item.linkedCameraId && removedCameraIds.has(item.linkedCameraId))
+      .map((item) => item.id)
+  );
+  const cameras = project.cameras
+    .filter((camera) => !removedCameraIds.has(camera.id))
+    .map((camera) => {
+      if (!camera.targetObjectId || !removedObjectIds.has(camera.targetObjectId)) return camera;
+
+      return {
+        ...camera,
+        targetMode: "manual" as const,
+        targetObjectId: null,
+      };
+    });
+  const objects = project.objects.filter(
+    (item) => !(item.linkedCameraId && removedCameraIds.has(item.linkedCameraId))
+  );
+  const activeCameraId =
+    project.activeCameraId && cameras.some((camera) => camera.id === project.activeCameraId)
+      ? project.activeCameraId
+      : cameras[0]?.id ?? null;
+
+  return {
+    project: {
+      ...project,
+      cameras,
+      objects,
+      activeCameraId,
+    },
+    removedCameraIds,
+    removedObjectIds,
+  };
+}
+
+function removeTemporaryCaptureCameraFromProject(
+  project: DirectorProject,
+  cameraId: string,
+  token: string
+): { project: DirectorProject; removed: boolean } {
+  const hasMatchingCamera = project.cameras.some(
+    (camera) => camera.id === cameraId && camera.transientCaptureToken === token
+  );
+  if (!hasMatchingCamera) return { project, removed: false };
+
+  const cameras = project.cameras.filter(
+    (camera) => !(camera.id === cameraId && camera.transientCaptureToken === token)
+  );
+  const objects = project.objects.filter((item) => item.linkedCameraId !== cameraId);
+  const activeCameraId =
+    project.activeCameraId && cameras.some((camera) => camera.id === project.activeCameraId)
+      ? project.activeCameraId
+      : cameras[0]?.id ?? null;
+
+  return {
+    removed: true,
+    project: {
+      ...project,
+      cameras,
+      objects,
+      activeCameraId,
+    },
+  };
+}
+
+function restoreTemporaryCaptureBaseline(
+  state: DirectorState,
+  project: DirectorProject,
+  input: TemporaryCameraCaptureRollbackInput
+): DirectorState {
+  const cameraIds = new Set(project.cameras.map((camera) => camera.id));
+  const objectIds = new Set(project.objects.map((item) => item.id));
+  const activeCameraId =
+    input.previousActiveCameraId && cameraIds.has(input.previousActiveCameraId)
+      ? input.previousActiveCameraId
+      : project.activeCameraId && cameraIds.has(project.activeCameraId)
+        ? project.activeCameraId
+        : project.cameras[0]?.id ?? null;
+  const selectedObjectIds = input.previousSelectedObjectIds.filter((id) => objectIds.has(id));
+  const selectedObjectId =
+    input.previousSelectedObjectId && objectIds.has(input.previousSelectedObjectId)
+      ? input.previousSelectedObjectId
+      : null;
+  const selectedCrowdId =
+    input.previousSelectedCrowdId && project.objects.some((item) => item.crowdId === input.previousSelectedCrowdId)
+      ? input.previousSelectedCrowdId
+      : null;
+
+  return {
+    ...state,
+    viewMode: input.previousViewMode ?? state.viewMode,
+    directorInspectorMode: input.previousDirectorInspectorMode ?? state.directorInspectorMode,
+    project: {
+      ...project,
+      activeCameraId,
+    },
+    selectedObjectId,
+    selectedObjectIds,
+    selectedCrowdId,
+  };
+}
+
+function normalizeTemporaryCaptureSnapshot(
+  snapshot: DirectorState,
+  input: TemporaryCameraCaptureRollbackInput
+): DirectorState {
+  const result = removeTemporaryCaptureCameraFromProject(snapshot.project, input.cameraId, input.token);
+  return result.removed ? restoreTemporaryCaptureBaseline(snapshot, result.project, input) : snapshot;
+}
+
+function trimTrailingNoOpUndoSnapshots(undoStack: DirectorState[], currentState: DirectorState): DirectorState[] {
+  let lastMeaningfulIndex = undoStack.length;
+
+  while (
+    lastMeaningfulIndex > 0 &&
+    isSameDirectorState(undoStack[lastMeaningfulIndex - 1]!, currentState)
+  ) {
+    lastMeaningfulIndex -= 1;
+  }
+
+  return lastMeaningfulIndex === undoStack.length ? undoStack : undoStack.slice(0, lastMeaningfulIndex);
+}
+
+function deduplicateAdjacentUndoSnapshots(undoStack: DirectorState[]): DirectorState[] {
+  if (undoStack.length < 2) return undoStack;
+
+  const deduplicated: DirectorState[] = [undoStack[0]!];
+  for (const snapshot of undoStack.slice(1)) {
+    if (!isSameDirectorState(deduplicated[deduplicated.length - 1]!, snapshot)) {
+      deduplicated.push(snapshot);
+    }
+  }
+
+  return deduplicated.length === undoStack.length ? undoStack : deduplicated;
 }
 
 export const useDirectorStore = create<DirectorStore>((set, get) => {
@@ -1657,6 +1870,15 @@ export const useDirectorStore = create<DirectorStore>((set, get) => {
         } satisfies DirectorAssetRef;
 
         if (input.kind === "panorama") {
+          const previousPanoramaAssetId = state.project.panoramaAssetId;
+          const previousPanoramaAsset = state.project.assets.find(
+            (item) =>
+              item.id === previousPanoramaAssetId && item.kind === "panorama" && item.sourceType === "image"
+          );
+          const assetsWithoutPreviousPanorama = previousPanoramaAsset
+            ? state.project.assets.filter((item) => item.id !== previousPanoramaAssetId)
+            : state.project.assets;
+
           return {
             ...state,
             directorInspectorMode: "scene",
@@ -1665,7 +1887,7 @@ export const useDirectorStore = create<DirectorStore>((set, get) => {
             selectedCrowdId: null,
             project: {
               ...state.project,
-              assets: [...state.project.assets, nextAsset],
+              assets: [...assetsWithoutPreviousPanorama, nextAsset],
               panoramaAssetId: assetId,
             },
           };
@@ -1887,6 +2109,142 @@ export const useDirectorStore = create<DirectorStore>((set, get) => {
 
       return nextCameraId;
     },
+    markTemporaryCameraCapture: (cameraId, token) => {
+      set((state) => {
+        const hasCamera = state.project.cameras.some((camera) => camera.id === cameraId);
+        if (!hasCamera) return state;
+
+        const nextState = {
+          ...state,
+          project: {
+            ...state.project,
+            cameras: state.project.cameras.map((camera) =>
+              camera.id === cameraId ? { ...camera, transientCaptureToken: token } : camera
+            ),
+          },
+        };
+        writePersistedDirectorState(extractPersistedDirectorState(nextState as DirectorRuntimeState));
+        return nextState;
+      });
+    },
+    commitTemporaryCameraCapture: (cameraId, token, dataUrls) => {
+      let committed = false;
+
+      set((state) => {
+        const currentState = state as DirectorRuntimeState;
+        const currentCamera = currentState.project.cameras.find(
+          (camera) => camera.id === cameraId && camera.transientCaptureToken === token
+        );
+        if (!currentCamera) return currentState;
+
+        committed = true;
+        const previousSnapshot = createUndoStackEntry(currentState);
+        const undoSnapshot = clearTemporaryCaptureTokenFromProject(previousSnapshot.project, cameraId, token);
+        const nextProject: DirectorProject = {
+          ...currentState.project,
+          cameras: currentState.project.cameras.map((camera) => {
+            if (camera.id !== cameraId || camera.transientCaptureToken !== token) return camera;
+
+            const { transientCaptureToken: _transientCaptureToken, ...cameraWithoutToken } = camera;
+            return appendCameraCaptures(cameraWithoutToken, dataUrls);
+          }),
+        };
+        const nextBatchSnapshot = currentState.undoBatchSnapshot
+          ? {
+              ...currentState.undoBatchSnapshot,
+              project: clearTemporaryCaptureTokenFromProject(
+                currentState.undoBatchSnapshot.project,
+                cameraId,
+                token
+              ),
+            }
+          : null;
+        const cleanedUndoStack = currentState.undoStack.map((snapshot) => ({
+          ...snapshot,
+          project: clearTemporaryCaptureTokenFromProject(snapshot.project, cameraId, token),
+        }));
+        const shouldCaptureUndoBatchSnapshot =
+          currentState.undoBatchDepth > 0 && currentState.undoBatchSnapshot === null;
+        const nextState: DirectorRuntimeState = {
+          ...currentState,
+          project: nextProject,
+          undoStack:
+            currentState.undoBatchDepth === 0
+              ? trimUndoStack([...cleanedUndoStack, { ...previousSnapshot, project: undoSnapshot }])
+              : cleanedUndoStack,
+          undoBatchSnapshot: shouldCaptureUndoBatchSnapshot
+            ? { ...previousSnapshot, project: undoSnapshot }
+            : nextBatchSnapshot,
+          undoBatchHasTrackedChanges:
+            currentState.undoBatchDepth > 0 ? true : currentState.undoBatchHasTrackedChanges,
+        };
+
+        writePersistedDirectorState(extractPersistedDirectorState(nextState));
+        return nextState;
+      });
+
+      return committed;
+    },
+    finalizeTemporaryCameraCapture: (cameraId, token) => {
+      set((state) => {
+        const nextState = {
+          ...state,
+          project: clearTemporaryCaptureTokenFromProject(state.project, cameraId, token),
+          undoStack: state.undoStack.map((snapshot) => ({
+            ...snapshot,
+            project: clearTemporaryCaptureTokenFromProject(snapshot.project, cameraId, token),
+          })),
+          undoBatchSnapshot: state.undoBatchSnapshot
+            ? {
+                ...state.undoBatchSnapshot,
+                project: clearTemporaryCaptureTokenFromProject(state.undoBatchSnapshot.project, cameraId, token),
+              }
+            : null,
+        };
+        writePersistedDirectorState(extractPersistedDirectorState(nextState as DirectorRuntimeState));
+        return nextState;
+      });
+    },
+    rollbackTemporaryCameraCapture: (input) => {
+      set((state) => {
+        const removal = removeTemporaryCaptureCameraFromProject(state.project, input.cameraId, input.token);
+        const undoStack = state.undoStack.map((snapshot) => normalizeTemporaryCaptureSnapshot(snapshot, input));
+        const undoBatchSnapshot = state.undoBatchSnapshot
+          ? normalizeTemporaryCaptureSnapshot(state.undoBatchSnapshot, input)
+          : null;
+        const restoredState = removal.removed
+          ? restoreTemporaryCaptureBaseline(state, removal.project, input)
+          : null;
+        const currentPersistedState = restoredState
+          ? extractPersistedDirectorState(restoredState as DirectorRuntimeState)
+          : extractPersistedDirectorState(state as DirectorRuntimeState);
+        const trimmedUndoStack = trimTrailingNoOpUndoSnapshots(undoStack, currentPersistedState);
+        const normalizedUndoStack = deduplicateAdjacentUndoSnapshots(trimmedUndoStack);
+        const undoStackChanged = normalizedUndoStack.some((snapshot, index) => snapshot !== state.undoStack[index]) ||
+          normalizedUndoStack.length !== state.undoStack.length;
+        const undoBatchChanged = undoBatchSnapshot !== state.undoBatchSnapshot;
+
+        if (!removal.removed) {
+          if (!undoStackChanged && !undoBatchChanged) return state;
+
+          const nextState = {
+            ...state,
+            undoStack: normalizedUndoStack,
+            undoBatchSnapshot,
+          };
+          writePersistedDirectorState(extractPersistedDirectorState(nextState as DirectorRuntimeState));
+          return nextState;
+        }
+
+        const nextState = {
+          ...restoredState,
+          undoStack: normalizedUndoStack,
+          undoBatchSnapshot,
+        };
+        writePersistedDirectorState(extractPersistedDirectorState(nextState as DirectorRuntimeState));
+        return nextState;
+      });
+    },
     deleteSelectedObject: () =>
       commitMutation((state) => {
         const selectedObjectIds = getOrderedSelectedObjectIds(state);
@@ -2093,13 +2451,7 @@ export const useDirectorStore = create<DirectorStore>((set, get) => {
           if (camera.id !== targetCameraId) return camera;
 
           updated = true;
-          const nextCaptures = buildCameraCaptures(camera, dataUrls);
-
-          return {
-            ...camera,
-            lastCaptureUrl: nextCaptures[nextCaptures.length - 1]?.dataUrl ?? camera.lastCaptureUrl ?? null,
-            captures: [...(camera.captures ?? []), ...nextCaptures],
-          };
+          return appendCameraCaptures(camera, dataUrls);
         });
 
         if (!updated) return state;
@@ -2363,10 +2715,14 @@ export const useDirectorStore = create<DirectorStore>((set, get) => {
             ? {
                 ...segment,
                 ...patch,
-                duration: patch.duration
-                  ? Number(Math.max(patch.duration, MIN_SEGMENT_DURATION).toFixed(6))
-                  : segment.duration,
-                holdAfter: patch.holdAfter ? Number(Math.max(patch.holdAfter, 0).toFixed(6)) : segment.holdAfter,
+                duration:
+                  patch.duration !== undefined
+                    ? Number(Math.max(patch.duration, MIN_SEGMENT_DURATION).toFixed(6))
+                    : segment.duration,
+                holdAfter:
+                  patch.holdAfter !== undefined
+                    ? Number(Math.max(patch.holdAfter, 0).toFixed(6))
+                    : segment.holdAfter,
               }
             : segment
         );
@@ -2465,7 +2821,7 @@ export const useDirectorStore = create<DirectorStore>((set, get) => {
     replaceProject: (project) =>
       commitMutation((state) => ({
         ...state,
-        project: cloneJsonValue(project),
+        project: migrateDirectorProject(cloneJsonValue(project)),
         selectedObjectId: null,
         selectedObjectIds: [],
         selectedCrowdId: null,

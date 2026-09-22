@@ -1,5 +1,5 @@
 import { Minus, Pause, Play, Plus, Square, Trash2, Video } from "lucide-react";
-import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { buildCameraSegments, getCameraPathDuration, getNodeStartTimes } from "../camera/cameraPath";
 import type { CameraSegmentEasing } from "../schema/directorProject";
 import { useCameraPlaybackStore } from "../store/cameraPlaybackStore";
@@ -17,6 +17,15 @@ const EASING_OPTIONS: Array<{ value: CameraSegmentEasing; label: string }> = [
   { value: "ease-out", label: "缓出" },
   { value: "ease-in-out", label: "缓入缓出" },
 ];
+
+type TimelineDrag = {
+  kind: "playhead" | "node";
+  nodeId?: string;
+  cameraId?: string;
+  pointerTarget: HTMLElement;
+  pointerId: number;
+  undoBatchActive: boolean;
+};
 
 function formatTime(seconds: number) {
   const total = Math.max(0, seconds);
@@ -66,9 +75,40 @@ export function DirectorTimeline() {
   const endUndoBatch = useDirectorStore((state) => state.endUndoBatch);
 
   const trackRef = useRef<HTMLDivElement | null>(null);
-  const dragRef = useRef<{ kind: "playhead" | "node"; nodeId?: string } | null>(null);
+  const dragRef = useRef<TimelineDrag | null>(null);
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+
+  const cameraId = camera?.id;
+  const cameraOwnedSelectedNode = selectedNode?.cameraId === cameraId ? selectedNode : null;
+  const cameraOwnedSelectedSegment = selectedSegment?.cameraId === cameraId ? selectedSegment : null;
+  const cameraOwnedSelectedHandle = selectedHandle?.cameraId === cameraId ? selectedHandle : null;
+
+  const cancelTrackDrag = useCallback(() => {
+    const drag = dragRef.current;
+    if (!drag) return;
+
+    dragRef.current = null;
+    if (drag.kind === "node" && drag.undoBatchActive) {
+      drag.undoBatchActive = false;
+      endUndoBatch();
+    }
+
+    try {
+      if (!drag.pointerTarget.hasPointerCapture || drag.pointerTarget.hasPointerCapture(drag.pointerId)) {
+        drag.pointerTarget.releasePointerCapture?.(drag.pointerId);
+      }
+    } catch {
+      // Pointer capture may already have been released by the browser.
+    }
+  }, [endUndoBatch]);
+
+  useEffect(() => {
+    cancelTrackDrag();
+    pause();
+    setPlayheadTime(0);
+    clearSelection();
+  }, [cameraId, cancelTrackDrag, clearSelection, pause, setPlayheadTime]);
 
   const contentWidth = Math.max(total * zoom + 320, 480);
 
@@ -80,10 +120,21 @@ export function DirectorTimeline() {
 
   function beginTrackDrag(event: ReactPointerEvent, kind: "playhead" | "node", nodeId?: string) {
     event.preventDefault();
-    (event.target as HTMLElement).setPointerCapture?.(event.pointerId);
-    dragRef.current = { kind, nodeId };
+    cancelTrackDrag();
+    const pointerTarget = event.currentTarget as HTMLElement;
+    pointerTarget.setPointerCapture?.(event.pointerId);
+    const drag: TimelineDrag = {
+      kind,
+      nodeId,
+      cameraId: camera?.id,
+      pointerTarget,
+      pointerId: event.pointerId,
+      undoBatchActive: false,
+    };
+    dragRef.current = drag;
     if (kind === "node" && nodeId && camera) {
       beginUndoBatch();
+      drag.undoBatchActive = true;
     }
   }
 
@@ -96,21 +147,19 @@ export function DirectorTimeline() {
       setPlayheadTime(timeFromPointer(event.clientX));
       return;
     }
-    if (drag.kind === "node" && drag.nodeId && camera) {
+    if (drag.kind === "node" && drag.nodeId && drag.cameraId === camera?.id && camera) {
       updateCameraNodeTime(camera.id, drag.nodeId, timeFromPointer(event.clientX));
     }
   }
 
-  function endTrackDrag() {
-    if (dragRef.current?.kind === "node") {
-      endUndoBatch();
-    }
-    dragRef.current = null;
-  }
+  const endTrackDrag = cancelTrackDrag;
 
-  const selectedNodeIndex = selectedNode && camera ? nodes.findIndex((node) => node.id === selectedNode.nodeId) : -1;
+  const selectedNodeIndex =
+    cameraOwnedSelectedNode && camera ? nodes.findIndex((node) => node.id === cameraOwnedSelectedNode.nodeId) : -1;
   const selectedSegmentData =
-    selectedSegment && camera ? segments.find((segment) => segment.id === selectedSegment.segmentId) : null;
+    cameraOwnedSelectedSegment && camera
+      ? segments.find((segment) => segment.id === cameraOwnedSelectedSegment.segmentId)
+      : null;
 
   async function handleExportVideo() {
     if (!camera) return;
@@ -169,9 +218,9 @@ export function DirectorTimeline() {
         </div>
         <div className="timeline-camera-name">{camera ? `${camera.name} · ${nodes.length} 个节点` : "无可用机位"}</div>
         <div className="timeline-inspector">
-          {selectedHandle ? (
+          {cameraOwnedSelectedHandle ? (
             <span className="timeline-hint">拖拽 3D 视口中的手柄编辑曲线，Delete 恢复直线手柄</span>
-          ) : selectedNode && camera ? (
+          ) : cameraOwnedSelectedNode && camera ? (
             <>
               <span className="timeline-hint">
                 节点 {String.fromCharCode(65 + Math.max(selectedNodeIndex, 0))} · {formatTime(startTimes[Math.max(selectedNodeIndex, 0)] ?? 0)}
@@ -181,7 +230,7 @@ export function DirectorTimeline() {
                 title="在该节点后插入新节点"
                 type="button"
                 onClick={() => {
-                  addCameraNode(camera.id, selectedNode.nodeId);
+                  addCameraNode(camera.id, cameraOwnedSelectedNode.nodeId);
                   selectHandle(null);
                 }}
               >
@@ -192,7 +241,7 @@ export function DirectorTimeline() {
                 title="删除该节点"
                 type="button"
                 onClick={() => {
-                  deleteCameraNode(camera.id, selectedNode.nodeId);
+                  deleteCameraNode(camera.id, cameraOwnedSelectedNode.nodeId);
                   clearSelection();
                 }}
               >
@@ -338,7 +387,7 @@ export function DirectorTimeline() {
               const start = startTimes[index] * zoom;
               const motionWidth = segment.duration * zoom;
               const holdWidth = segment.holdAfter * zoom;
-              const isSelected = selectedSegment?.segmentId === segment.id;
+              const isSelected = cameraOwnedSelectedSegment?.segmentId === segment.id;
               return (
                 <button
                   key={segment.id}
@@ -361,7 +410,7 @@ export function DirectorTimeline() {
               );
             })}
             {nodes.map((node, index) => {
-              const isSelected = selectedNode?.nodeId === node.id;
+              const isSelected = cameraOwnedSelectedNode?.nodeId === node.id;
               return (
                 <button
                   key={node.id}
